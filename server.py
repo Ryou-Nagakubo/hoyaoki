@@ -60,10 +60,8 @@ async def perform_analysis():
         return None, "指定されたチャンネルが見つかりませんでした。"
 
     # ユーザーごと、日付ごとの最初の投稿を記録
-    # { user_name: { "YYYY-MM-DD": earliest_datetime } }
     user_daily_first_post = defaultdict(dict)
     
-    # JSTでの「今日」の日付を取得
     today_jst = (datetime.datetime.utcnow() + datetime.timedelta(hours=9)).date()
 
     async for message in target_channel.history(limit=MESSAGE_LIMIT):
@@ -73,14 +71,12 @@ async def perform_analysis():
         timestamp_utc = message.created_at
         timestamp_jst = timestamp_utc + datetime.timedelta(hours=9)
         
-        # 17:00以降の投稿は無視
         if timestamp_jst.hour >= 17:
             continue
 
         date_str = timestamp_jst.strftime("%Y-%m-%d")
         user_name = message.author.global_name or message.author.username
 
-        # その日の最初の投稿でなければ記録を更新
         if date_str not in user_daily_first_post[user_name] or timestamp_jst < user_daily_first_post[user_name][date_str]:
             user_daily_first_post[user_name][date_str] = timestamp_jst
 
@@ -98,8 +94,9 @@ async def perform_analysis():
             'averageWakeUpSeconds': average_seconds
         })
 
-    # 投稿数でソート
-    analysis_data.sort(key=lambda x: x['postCount'], reverse=True)
+    # ↓↓↓ ここのソート順を変更しました ↓↓↓
+    # 平均起床時間（秒）が少ない順（=早い順）にソート
+    analysis_data.sort(key=lambda x: x['averageWakeUpSeconds'])
     return analysis_data, None
 
 # --- スプレッドシート更新ロジック ---
