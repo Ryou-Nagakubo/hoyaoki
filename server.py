@@ -102,7 +102,6 @@ async def perform_analysis():
     analysis_data.sort(key=lambda x: x['postCount'], reverse=True)
     return analysis_data, None
 
-
 # --- スプレッドシート更新ロジック ---
 def update_spreadsheet(analysis_data):
     print("スプレッドシートの更新を開始します...")
@@ -110,8 +109,8 @@ def update_spreadsheet(analysis_data):
     sheet.clear()
 
     headers = ['順位', 'ユーザー名', '記録日数', '平均起床時間', '起床時間グラフ']
-    sheet.getRange(1, 1, 1, headers.length).setValues([headers])
-        .setBackground('#11aedd').setFontColor('#ffffff').setFontWeight('bold').setHorizontalAlignment('center')
+    # ↓↓↓ 問題の箇所をこの1行に修正しました ↓↓↓
+    sheet.getRange(1, 1, 1, len(headers)).setValues([headers]).setBackground('#11aedd').setFontColor('#ffffff').setFontWeight('bold').setHorizontalAlignment('center')
 
     rows = []
     for index, user in enumerate(analysis_data):
@@ -128,7 +127,7 @@ def update_spreadsheet(analysis_data):
 
     if rows:
         sheet.getRange(2, 1, len(rows), len(headers)).setValues(rows)
-    
+
     sheet.setFrozenRows(1)
     sheet.getRange('A:E').setVerticalAlignment('middle')
     sheet.getRange('A:A').setHorizontalAlignment('center')
