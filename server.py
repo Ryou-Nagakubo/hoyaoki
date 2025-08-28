@@ -109,11 +109,14 @@ def update_spreadsheet(analysis_data):
         sheet = get_sheet()
         sheet.clear()
 
-        headers = ['順位', 'ユーザー名', '記録日数', '平均起床時間', '起床時間グラフ']
-
+        # ヘッダーからグラフの項目を削除
+        headers = ['順位', 'ユーザー名', '記録日数', '平均起床時間']
+        
+        # ヘッダーを書き込み
         sheet.update('A1', [headers])
-
-        sheet.format('A1:E1', {
+        
+        # ヘッダーのフォーマットを設定
+        sheet.format('A1:D1', { # E列からD列に変更
             "backgroundColor": { "red": 0.06, "green": 0.68, "blue": 0.86 },
             "textFormat": { "foregroundColor": { "red": 1.0, "green": 1.0, "blue": 1.0 }, "bold": True },
             "horizontalAlignment": "CENTER"
@@ -122,25 +125,26 @@ def update_spreadsheet(analysis_data):
         rows = []
         for index, user in enumerate(analysis_data):
             avg_time_str = seconds_to_time_str(user['averageWakeUpSeconds'])
-            # ↓↓↓ 問題の箇所(; を , に修正しました) ↓↓↓
-            sparkline_formula = f'=SPARKLINE({{{user["averageWakeUpSeconds"]}}}, {{"charttype", "column", "ymin", 14400, "ymax", 43200, "color", "#11aedd"}})'
+            # グラフの数式を削除
             rows.append([
                 index + 1,
                 user['userName'],
                 user['postCount'],
-                avg_time_str,
-                sparkline_formula
+                avg_time_str
             ])
 
         if rows:
+            # A2からデータを書き込み
             sheet.update('A2', rows)
-
+        
         sheet.freeze(rows=1)
-
-        sheet.format("A:E", {"verticalAlignment": "MIDDLE"})
+        
+        # 全体のフォーマット
+        sheet.format("A:D", {"verticalAlignment": "MIDDLE"}) # E列からD列に変更
         sheet.format("A:A", {"horizontalAlignment": "CENTER"})
         sheet.format("C:D", {"horizontalAlignment": "CENTER"})
 
+        # 列幅を自動調整
         body = {
             "requests": [
                 {
@@ -149,16 +153,16 @@ def update_spreadsheet(analysis_data):
                             "sheetId": sheet.id,
                             "dimension": "COLUMNS",
                             "startIndex": 0,
-                            "endIndex": len(headers)
+                            "endIndex": len(headers) # 自動的に4になる
                         }
                     }
                 }
             ]
         }
         sheet.spreadsheet.batch_update(body)
-
+            
         print("スプレッドシートの更新が完了しました。")
-
+        
     except Exception as e:
         print(f"スプレッドシート更新中にエラーが発生: {e}")
         raise
