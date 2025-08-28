@@ -107,18 +107,20 @@ def update_spreadsheet(analysis_data):
     print("スプレッドシートの更新を開始します...")
     try:
         sheet = get_sheet()
+        
+        # --- シートの初期化 ---
+        # 全てのセルをクリアし、不要な行/列を削除してまっさらな状態にする
         sheet.clear()
+        if sheet.row_count > 1:
+            sheet.delete_rows(2, sheet.row_count)
+        if sheet.column_count > 4:
+            sheet.delete_columns(5, sheet.column_count)
 
         headers = ['順位', 'ユーザー名', '記録日数', '平均起床時間']
         
+        # ヘッダーを書き込み
         sheet.update('A1', [headers])
         
-        sheet.format('A1:D1', {
-            "backgroundColor": { "red": 0.06, "green": 0.68, "blue": 0.86 },
-            "textFormat": { "foregroundColor": { "red": 1.0, "green": 1.0, "blue": 1.0 }, "bold": True },
-            "horizontalAlignment": "CENTER"
-        })
-
         rows = []
         for index, user in enumerate(analysis_data):
             avg_time_str = seconds_to_time_str(user['averageWakeUpSeconds'])
@@ -130,33 +132,27 @@ def update_spreadsheet(analysis_data):
             ])
 
         if rows:
+            # A2からデータを書き込み
             sheet.update('A2', rows)
-        
-        sheet.freeze(rows=1)
-        
-        sheet.format("A:D", {"verticalAlignment": "MIDDLE"})
-        sheet.format("A:A", {"horizontalAlignment": "CENTER"})
-        sheet.format("C:D", {"horizontalAlignment": "CENTER"})
 
-        # ↓↓↓ 処理が速すぎる問題を防ぐため、1秒待機する処理を追加 ↓↓↓
-        time.sleep(1)
-
-        # 列幅を自動調整
-        body = {
-            "requests": [
-                {
-                    "autoResizeDimensions": {
-                        "dimensions": {
-                            "sheetId": sheet.id,
-                            "dimension": "COLUMNS",
-                            "startIndex": 0,
-                            "endIndex": len(headers)
-                        }
-                    }
-                }
-            ]
-        }
-        sheet.spreadsheet.batch_update(body)
+        # --- 書式設定と列幅指定をまとめて実行 ---
+        requests = [
+            # ヘッダー行を固定
+            { "updateSheetProperties": { "properties": { "sheetId": sheet.id, "gridProperties": { "frozenRowCount": 1 } }, "fields": "gridProperties.frozenRowCount" } },
+            # ヘッダーの書式設定 (A1:D1)
+            { "repeatCell": { "range": { "sheetId": sheet.id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 4 }, "cell": { "userEnteredFormat": { "backgroundColor": { "red": 0.06, "green": 0.68, "blue": 0.86 }, "textFormat": { "foregroundColor": { "red": 1.0, "green": 1.0, "blue": 1.0 }, "bold": True }, "horizontalAlignment": "CENTER" } }, "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)" } },
+            # 全体の垂直方向の配置 (A:D)
+            { "repeatCell": { "range": { "sheetId": sheet.id, "startColumnIndex": 0, "endColumnIndex": 4 }, "cell": { "userEnteredFormat": { "verticalAlignment": "MIDDLE" } }, "fields": "userEnteredFormat.verticalAlignment" } },
+            # 特定列の水平方向の配置 (A, C, D)
+            { "repeatCell": { "range": { "sheetId": sheet.id, "startColumnIndex": 0, "endColumnIndex": 1 }, "cell": { "userEnteredFormat": { "horizontalAlignment": "CENTER" } }, "fields": "userEnteredFormat.horizontalAlignment" } },
+            { "repeatCell": { "range": { "sheetId": sheet.id, "startColumnIndex": 2, "endColumnIndex": 4 }, "cell": { "userEnteredFormat": { "horizontalAlignment": "CENTER" } }, "fields": "userEnteredFormat.horizontalAlignment" } },
+            # 列幅を手動で指定
+            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1 }, "properties": { "pixelSize": 60 }, "fields": "pixelSize" } }, # A列: 順位
+            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 2 }, "properties": { "pixelSize": 180 }, "fields": "pixelSize" } }, # B列: ユーザー名
+            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 2, "endIndex": 3 }, "properties": { "pixelSize": 80 }, "fields": "pixelSize" } }, # C列: 記録日数
+            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 3, "endIndex": 4 }, "properties": { "pixelSize": 120 }, "fields": "pixelSize" } }  # D列: 平均起床時間
+        ]
+        sheet.spreadsheet.batch_update({"requests": requests})
             
         print("スプレッドシートの更新が完了しました。")
         
