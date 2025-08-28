@@ -109,12 +109,8 @@ def update_spreadsheet(analysis_data):
         sheet = get_sheet()
         
         # --- シートの初期化 ---
-        # 全てのセルをクリアし、不要な行/列を削除してまっさらな状態にする
+        # 値をすべてクリアする (行や列の削除は行わない)
         sheet.clear()
-        if sheet.row_count > 1:
-            sheet.delete_rows(2, sheet.row_count)
-        if sheet.column_count > 4:
-            sheet.delete_columns(5, sheet.column_count)
 
         headers = ['順位', 'ユーザー名', '記録日数', '平均起床時間']
         
