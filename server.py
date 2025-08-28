@@ -109,14 +109,11 @@ def update_spreadsheet(analysis_data):
         sheet = get_sheet()
         sheet.clear()
 
-        # ヘッダーからグラフの項目を削除
         headers = ['順位', 'ユーザー名', '記録日数', '平均起床時間']
         
-        # ヘッダーを書き込み
         sheet.update('A1', [headers])
         
-        # ヘッダーのフォーマットを設定
-        sheet.format('A1:D1', { # E列からD列に変更
+        sheet.format('A1:D1', {
             "backgroundColor": { "red": 0.06, "green": 0.68, "blue": 0.86 },
             "textFormat": { "foregroundColor": { "red": 1.0, "green": 1.0, "blue": 1.0 }, "bold": True },
             "horizontalAlignment": "CENTER"
@@ -125,7 +122,6 @@ def update_spreadsheet(analysis_data):
         rows = []
         for index, user in enumerate(analysis_data):
             avg_time_str = seconds_to_time_str(user['averageWakeUpSeconds'])
-            # グラフの数式を削除
             rows.append([
                 index + 1,
                 user['userName'],
@@ -134,15 +130,16 @@ def update_spreadsheet(analysis_data):
             ])
 
         if rows:
-            # A2からデータを書き込み
             sheet.update('A2', rows)
         
         sheet.freeze(rows=1)
         
-        # 全体のフォーマット
-        sheet.format("A:D", {"verticalAlignment": "MIDDLE"}) # E列からD列に変更
+        sheet.format("A:D", {"verticalAlignment": "MIDDLE"})
         sheet.format("A:A", {"horizontalAlignment": "CENTER"})
         sheet.format("C:D", {"horizontalAlignment": "CENTER"})
+
+        # ↓↓↓ 処理が速すぎる問題を防ぐため、1秒待機する処理を追加 ↓↓↓
+        time.sleep(1)
 
         # 列幅を自動調整
         body = {
@@ -153,7 +150,7 @@ def update_spreadsheet(analysis_data):
                             "sheetId": sheet.id,
                             "dimension": "COLUMNS",
                             "startIndex": 0,
-                            "endIndex": len(headers) # 自動的に4になる
+                            "endIndex": len(headers)
                         }
                     }
                 }
