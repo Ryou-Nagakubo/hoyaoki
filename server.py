@@ -105,51 +105,70 @@ async def perform_analysis():
 # --- スプレッドシート更新ロジック ---
 def update_spreadsheet(analysis_data):
     print("スプレッドシートの更新を開始します...")
-    sheet = get_sheet()
-    sheet.clear()
+    try:
+        sheet = get_sheet()
+        sheet.clear()
 
-    headers = ['順位', 'ユーザー名', '記録日数', '平均起床時間', '起床時間グラフ']
+        headers = ['順位', 'ユーザー名', '記録日数', '平均起床時間', '起床時間グラフ']
+        
+        # ヘッダーを書き込み
+        sheet.update('A1', [headers])
+        
+        # ヘッダーのフォーマットを設定
+        sheet.format('A1:E1', {
+            "backgroundColor": { "red": 0.06, "green": 0.68, "blue": 0.86 }, # #11aedd
+            "textFormat": { "foregroundColor": { "red": 1.0, "green": 1.0, "blue": 1.0 }, "bold": True },
+            "horizontalAlignment": "CENTER"
+        })
 
-    # ヘッダーを書き込み
-    sheet.update('A1', [headers])
+        rows = []
+        for index, user in enumerate(analysis_data):
+            avg_time_str = seconds_to_time_str(user['averageWakeUpSeconds'])
+            sparkline_formula = f'=SPARKLINE({{{user["averageWakeUpSeconds"]}}}, {{"charttype", "column"; "ymin", 14400; "ymax", 43200; "color", "#11aedd"}})'
+            rows.append([
+                index + 1,
+                user['userName'],
+                user['postCount'],
+                avg_time_str,
+                sparkline_formula
+            ])
 
-    # ヘッダーのフォーマットを設定
-    sheet.format('A1:E1', {
-        "backgroundColor": { "red": 0.06, "green": 0.68, "blue": 0.86 }, # #11aedd
-        "textFormat": { "foregroundColor": { "red": 1.0, "green": 1.0, "blue": 1.0 }, "bold": True },
-        "horizontalAlignment": "CENTER"
-    })
+        if rows:
+            # A2からデータを書き込み
+            sheet.update('A2', rows)
+        
+        # ヘッダー行を固定
+        sheet.freeze(rows=1)
+        
+        # 全体のフォーマット
+        sheet.format("A:E", {"verticalAlignment": "MIDDLE"})
+        sheet.format("A:A", {"horizontalAlignment": "CENTER"})
+        sheet.format("C:D", {"horizontalAlignment": "CENTER"})
 
-    rows = []
-    for index, user in enumerate(analysis_data):
-        avg_time_str = seconds_to_time_str(user['averageWakeUpSeconds'])
-        # グラフは4時(14400s)から12時(43200s)の範囲で表示
-        sparkline_formula = f'=SPARKLINE({{{user["averageWakeUpSeconds"]}}}, {{"charttype", "column"; "ymin", 14400; "ymax", 43200; "color", "#11aedd"}})'
-        rows.append([
-            index + 1,
-            user['userName'],
-            user['postCount'],
-            avg_time_str,
-            sparkline_formula
-        ])
-
-    if rows:
-        # A2からデータを書き込み
-        sheet.update('A2', rows)
-
-    # ヘッダー行を固定
-    sheet.freeze(rows=1)
-
-    # 全体のフォーマット
-    sheet.format("A:E", {"verticalAlignment": "MIDDLE"})
-    sheet.format("A:A", {"horizontalAlignment": "CENTER"})
-    sheet.format("C:D", {"horizontalAlignment": "CENTER"}) # C列とD列を中央揃え
-
-    # 列幅を自動調整
-    for i in range(1, len(headers) + 1):
-        sheet.auto_resize_column(i)
-
-    print("スプレッドシートの更新が完了しました。")
+        # ↓↓↓ 問題の箇所をgspreadの正しい方法に修正しました ↓↓↓
+        # 列幅を自動調整 (A列からE列まで)
+        body = {
+            "requests": [
+                {
+                    "autoResizeDimensions": {
+                        "dimensions": {
+                            "sheetId": sheet.id,
+                            "dimension": "COLUMNS",
+                            "startIndex": 0,  # A列
+                            "endIndex": len(headers) # E列の次
+                        }
+                    }
+                }
+            ]
+        }
+        sheet.spreadsheet.batch_update(body)
+            
+        print("スプレッドシートの更新が完了しました。")
+        
+    except Exception as e:
+        print(f"スプレッドシート更新中にエラーが発生: {e}")
+        # エラーをbotの実行元に再スローして、Discordに通知できるようにする
+        raise
 
 # --- Discordボットの本体 ---
 intents = discord.Intents.default()
