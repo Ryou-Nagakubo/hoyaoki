@@ -108,14 +108,17 @@ def update_spreadsheet(analysis_data):
     try:
         sheet = get_sheet()
         
-        # --- シートの初期化 ---
-        # 値をすべてクリアする (行や列の削除は行わない)
         sheet.clear()
 
         headers = ['順位', 'ユーザー名', '記録日数', '平均起床時間']
         
-        # ヘッダーを書き込み
-        sheet.update('A1', [headers])
+        # --- 最終更新日時を追加 ---
+        now_jst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+        timestamp_str = f"最終更新: {now_jst.strftime('%Y/%m/%d %H:%M')}"
+        
+        # ヘッダーとタイムスタンプを1行にまとめる
+        header_row = headers + [timestamp_str]
+        sheet.update('A1', [header_row])
         
         rows = []
         for index, user in enumerate(analysis_data):
@@ -128,7 +131,6 @@ def update_spreadsheet(analysis_data):
             ])
 
         if rows:
-            # A2からデータを書き込み
             sheet.update('A2', rows)
 
         # --- 書式設定と列幅指定をまとめて実行 ---
@@ -137,16 +139,19 @@ def update_spreadsheet(analysis_data):
             { "updateSheetProperties": { "properties": { "sheetId": sheet.id, "gridProperties": { "frozenRowCount": 1 } }, "fields": "gridProperties.frozenRowCount" } },
             # ヘッダーの書式設定 (A1:D1)
             { "repeatCell": { "range": { "sheetId": sheet.id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 4 }, "cell": { "userEnteredFormat": { "backgroundColor": { "red": 0.06, "green": 0.68, "blue": 0.86 }, "textFormat": { "foregroundColor": { "red": 1.0, "green": 1.0, "blue": 1.0 }, "bold": True }, "horizontalAlignment": "CENTER" } }, "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)" } },
-            # 全体の垂直方向の配置 (A:D)
-            { "repeatCell": { "range": { "sheetId": sheet.id, "startColumnIndex": 0, "endColumnIndex": 4 }, "cell": { "userEnteredFormat": { "verticalAlignment": "MIDDLE" } }, "fields": "userEnteredFormat.verticalAlignment" } },
+            # タイムスタンプの書式設定 (E1)
+            { "repeatCell": { "range": { "sheetId": sheet.id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 4, "endColumnIndex": 5 }, "cell": { "userEnteredFormat": { "textFormat": { "foregroundColor": { "red": 0.4, "green": 0.4, "blue": 0.4 }, "italic": True }, "horizontalAlignment": "RIGHT" } }, "fields": "userEnteredFormat(textFormat,horizontalAlignment)" } },
+            # 全体の垂直方向の配置 (A:E)
+            { "repeatCell": { "range": { "sheetId": sheet.id, "startColumnIndex": 0, "endColumnIndex": 5 }, "cell": { "userEnteredFormat": { "verticalAlignment": "MIDDLE" } }, "fields": "userEnteredFormat.verticalAlignment" } },
             # 特定列の水平方向の配置 (A, C, D)
             { "repeatCell": { "range": { "sheetId": sheet.id, "startColumnIndex": 0, "endColumnIndex": 1 }, "cell": { "userEnteredFormat": { "horizontalAlignment": "CENTER" } }, "fields": "userEnteredFormat.horizontalAlignment" } },
             { "repeatCell": { "range": { "sheetId": sheet.id, "startColumnIndex": 2, "endColumnIndex": 4 }, "cell": { "userEnteredFormat": { "horizontalAlignment": "CENTER" } }, "fields": "userEnteredFormat.horizontalAlignment" } },
             # 列幅を手動で指定
-            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1 }, "properties": { "pixelSize": 60 }, "fields": "pixelSize" } }, # A列: 順位
-            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 2 }, "properties": { "pixelSize": 180 }, "fields": "pixelSize" } }, # B列: ユーザー名
-            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 2, "endIndex": 3 }, "properties": { "pixelSize": 80 }, "fields": "pixelSize" } }, # C列: 記録日数
-            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 3, "endIndex": 4 }, "properties": { "pixelSize": 120 }, "fields": "pixelSize" } }  # D列: 平均起床時間
+            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1 }, "properties": { "pixelSize": 60 }, "fields": "pixelSize" } }, # A列
+            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 2 }, "properties": { "pixelSize": 180 }, "fields": "pixelSize" } }, # B列
+            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 2, "endIndex": 3 }, "properties": { "pixelSize": 80 }, "fields": "pixelSize" } }, # C列
+            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 3, "endIndex": 4 }, "properties": { "pixelSize": 120 }, "fields": "pixelSize" } }, # D列
+            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 4, "endIndex": 5 }, "properties": { "pixelSize": 200 }, "fields": "pixelSize" } }  # E列: タイムスタンプ
         ]
         sheet.spreadsheet.batch_update({"requests": requests})
             
