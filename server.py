@@ -138,7 +138,7 @@ def update_spreadsheet(analysis_data):
         sheet.update('A2', rows)
 
     # ヘッダー行を固定
-    sheet.set_frozen(rows=1)
+    sheet.freeze(rows=1)
 
     # 全体のフォーマット
     sheet.format("A:E", {"verticalAlignment": "MIDDLE"})
