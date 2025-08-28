@@ -110,13 +110,11 @@ def update_spreadsheet(analysis_data):
         sheet.clear()
 
         headers = ['順位', 'ユーザー名', '記録日数', '平均起床時間', '起床時間グラフ']
-        
-        # ヘッダーを書き込み
+
         sheet.update('A1', [headers])
-        
-        # ヘッダーのフォーマットを設定
+
         sheet.format('A1:E1', {
-            "backgroundColor": { "red": 0.06, "green": 0.68, "blue": 0.86 }, # #11aedd
+            "backgroundColor": { "red": 0.06, "green": 0.68, "blue": 0.86 },
             "textFormat": { "foregroundColor": { "red": 1.0, "green": 1.0, "blue": 1.0 }, "bold": True },
             "horizontalAlignment": "CENTER"
         })
@@ -124,7 +122,8 @@ def update_spreadsheet(analysis_data):
         rows = []
         for index, user in enumerate(analysis_data):
             avg_time_str = seconds_to_time_str(user['averageWakeUpSeconds'])
-            sparkline_formula = f'=SPARKLINE({{{user["averageWakeUpSeconds"]}}}, {{"charttype", "column"; "ymin", 14400; "ymax", 43200; "color", "#11aedd"}})'
+            # ↓↓↓ 問題の箇所(; を , に修正しました) ↓↓↓
+            sparkline_formula = f'=SPARKLINE({{{user["averageWakeUpSeconds"]}}}, {{"charttype", "column", "ymin", 14400, "ymax", 43200, "color", "#11aedd"}})'
             rows.append([
                 index + 1,
                 user['userName'],
@@ -134,19 +133,14 @@ def update_spreadsheet(analysis_data):
             ])
 
         if rows:
-            # A2からデータを書き込み
             sheet.update('A2', rows)
-        
-        # ヘッダー行を固定
+
         sheet.freeze(rows=1)
-        
-        # 全体のフォーマット
+
         sheet.format("A:E", {"verticalAlignment": "MIDDLE"})
         sheet.format("A:A", {"horizontalAlignment": "CENTER"})
         sheet.format("C:D", {"horizontalAlignment": "CENTER"})
 
-        # ↓↓↓ 問題の箇所をgspreadの正しい方法に修正しました ↓↓↓
-        # 列幅を自動調整 (A列からE列まで)
         body = {
             "requests": [
                 {
@@ -154,20 +148,19 @@ def update_spreadsheet(analysis_data):
                         "dimensions": {
                             "sheetId": sheet.id,
                             "dimension": "COLUMNS",
-                            "startIndex": 0,  # A列
-                            "endIndex": len(headers) # E列の次
+                            "startIndex": 0,
+                            "endIndex": len(headers)
                         }
                     }
                 }
             ]
         }
         sheet.spreadsheet.batch_update(body)
-            
+
         print("スプレッドシートの更新が完了しました。")
-        
+
     except Exception as e:
         print(f"スプレッドシート更新中にエラーが発生: {e}")
-        # エラーをbotの実行元に再スローして、Discordに通知できるようにする
         raise
 
 # --- Discordボットの本体 ---
