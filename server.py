@@ -109,8 +109,16 @@ def update_spreadsheet(analysis_data):
     sheet.clear()
 
     headers = ['順位', 'ユーザー名', '記録日数', '平均起床時間', '起床時間グラフ']
-    # ↓↓↓ 問題の箇所をこの1行に修正しました ↓↓↓
-    sheet.getRange(1, 1, 1, len(headers)).setValues([headers]).setBackground('#11aedd').setFontColor('#ffffff').setFontWeight('bold').setHorizontalAlignment('center')
+
+    # ヘッダーを書き込み
+    sheet.update('A1', [headers])
+
+    # ヘッダーのフォーマットを設定
+    sheet.format('A1:E1', {
+        "backgroundColor": { "red": 0.06, "green": 0.68, "blue": 0.86 }, # #11aedd
+        "textFormat": { "foregroundColor": { "red": 1.0, "green": 1.0, "blue": 1.0 }, "bold": True },
+        "horizontalAlignment": "CENTER"
+    })
 
     rows = []
     for index, user in enumerate(analysis_data):
@@ -126,17 +134,22 @@ def update_spreadsheet(analysis_data):
         ])
 
     if rows:
-        sheet.getRange(2, 1, len(rows), len(headers)).setValues(rows)
+        # A2からデータを書き込み
+        sheet.update('A2', rows)
 
-    sheet.setFrozenRows(1)
-    sheet.getRange('A:E').setVerticalAlignment('middle')
-    sheet.getRange('A:A').setHorizontalAlignment('center')
-    sheet.getRange('C:C').setHorizontalAlignment('center')
-    sheet.getRange('D:D').setHorizontalAlignment('center')
+    # ヘッダー行を固定
+    sheet.set_frozen(rows=1)
+
+    # 全体のフォーマット
+    sheet.format("A:E", {"verticalAlignment": "MIDDLE"})
+    sheet.format("A:A", {"horizontalAlignment": "CENTER"})
+    sheet.format("C:D", {"horizontalAlignment": "CENTER"}) # C列とD列を中央揃え
+
+    # 列幅を自動調整
     for i in range(1, len(headers) + 1):
-        sheet.autoResizeColumn(i)
-    print("スプレッドシートの更新が完了しました。")
+        sheet.auto_resize_column(i)
 
+    print("スプレッドシートの更新が完了しました。")
 
 # --- Discordボットの本体 ---
 intents = discord.Intents.default()
