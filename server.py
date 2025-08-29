@@ -6,18 +6,18 @@ import os
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from collections import defaultdict
-import math
 import datetime
 import requests
 import json
 import time
 import schedule
+import asyncio
 
 # --- Renderの環境変数から設定を読み込む ---
 BOT_TOKEN = os.environ.get('DISCORD_TOKEN')
 TARGET_CHANNEL_ID = int(os.environ.get('DISCORD_CHANNEL_ID'))
 SHEET_ID = os.environ.get('SHEET_ID')
-MESSAGE_LIMIT = 10000 # 取得するメッセージの上限
+MESSAGE_LIMIT = 20000 # 2ヶ月分のデータを取得するため上限を増やす
 
 # --- Flask (Webサーバー) の設定 ---
 app = Flask('')
@@ -47,32 +47,41 @@ def time_to_seconds(dt):
     return dt.hour * 3600 + dt.minute * 60 + dt.second
 
 def seconds_to_time_str(seconds):
+    if seconds is None:
+        return "--:--"
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     return f"{h:02d}:{m:02d}"
+
+def format_delta_seconds(seconds):
+    if seconds is None:
+        return "N/A"
+    total_minutes = round(seconds / 60)
+    sign = "+" if total_minutes >= 0 else "-"
+    return f"{sign}{abs(total_minutes)}分"
 
 # --- メインの分析ロジック ---
 async def perform_analysis():
     print("分析処理を開始します...")
     target_channel = bot.get_channel(TARGET_CHANNEL_ID)
     if not target_channel:
-        print(f"エラー: チャンネルID {TARGET_CHANNEL_ID} が見つかりません。")
         return None, "指定されたチャンネルが見つかりませんでした。"
 
-    # ユーザーごと、日付ごとの最初の投稿を記録
+    now_jst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+    current_month = now_jst.month
+    current_year = now_jst.year
+    
+    prev_month_date = now_jst.replace(day=1) - datetime.timedelta(days=1)
+    prev_month = prev_month_date.month
+    prev_year = prev_month_date.year
+
     user_daily_first_post = defaultdict(dict)
     
-    today_jst = (datetime.datetime.utcnow() + datetime.timedelta(hours=9)).date()
-
     async for message in target_channel.history(limit=MESSAGE_LIMIT):
-        if message.author.bot:
-            continue
+        if message.author.bot: continue
 
-        timestamp_utc = message.created_at
-        timestamp_jst = timestamp_utc + datetime.timedelta(hours=9)
-        
-        if timestamp_jst.hour >= 17:
-            continue
+        timestamp_jst = message.created_at + datetime.timedelta(hours=9)
+        if timestamp_jst.hour >= 17: continue
 
         date_str = timestamp_jst.strftime("%Y-%m-%d")
         user_name = message.author.global_name or message.author.username
@@ -80,23 +89,35 @@ async def perform_analysis():
         if date_str not in user_daily_first_post[user_name] or timestamp_jst < user_daily_first_post[user_name][date_str]:
             user_daily_first_post[user_name][date_str] = timestamp_jst
 
-    # 平均起床時間を計算
-    analysis_data = []
+    # 月別にデータを集計
+    user_monthly_stats = defaultdict(lambda: {"current": [], "previous": []})
     for user_name, daily_posts in user_daily_first_post.items():
-        wake_up_times_seconds = [time_to_seconds(dt) for dt in daily_posts.values()]
-        if not wake_up_times_seconds:
-            continue
-        
-        average_seconds = sum(wake_up_times_seconds) / len(wake_up_times_seconds)
-        analysis_data.append({
-            'userName': user_name,
-            'postCount': len(wake_up_times_seconds),
-            'averageWakeUpSeconds': average_seconds
-        })
+        for post_time in daily_posts.values():
+            seconds = time_to_seconds(post_time)
+            if post_time.year == current_year and post_time.month == current_month:
+                user_monthly_stats[user_name]["current"].append(seconds)
+            elif post_time.year == prev_year and post_time.month == prev_month:
+                user_monthly_stats[user_name]["previous"].append(seconds)
 
-    # ↓↓↓ ここのソート順を変更しました ↓↓↓
-    # 平均起床時間（秒）が少ない順（=早い順）にソート
-    analysis_data.sort(key=lambda x: x['averageWakeUpSeconds'])
+    analysis_data = []
+    for user_name, stats in user_monthly_stats.items():
+        current_avg = sum(stats["current"]) / len(stats["current"]) if stats["current"] else None
+        previous_avg = sum(stats["previous"]) / len(stats["previous"]) if stats["previous"] else None
+        
+        delta = current_avg - previous_avg if current_avg is not None and previous_avg is not None else None
+        
+        # 今月の記録があるユーザーのみを対象とする
+        if current_avg is not None:
+            analysis_data.append({
+                'userName': user_name,
+                'current_avg_sec': current_avg,
+                'current_count': len(stats["current"]),
+                'previous_avg_sec': previous_avg,
+                'previous_count': len(stats["previous"]),
+                'delta_sec': delta
+            })
+
+    analysis_data.sort(key=lambda x: x['current_avg_sec'])
     return analysis_data, None
 
 # --- スプレッドシート更新ロジック ---
@@ -104,51 +125,48 @@ def update_spreadsheet(analysis_data):
     print("スプレッドシートの更新を開始します...")
     try:
         sheet = get_sheet()
-        
         sheet.clear()
-
-        headers = ['順位', 'ユーザー名', '記録日数', '平均起床時間']
         
-        # --- 最終更新日時を追加 ---
         now_jst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
-        timestamp_str = f"最終更新: {now_jst.strftime('%Y/%m/%d %H:%M')}"
+        timestamp_str = f"起床時刻ランキング (最終更新: {now_jst.strftime('%Y/%m/%d %H:%M')})"
         
-        # ヘッダーとタイムスタンプを1行にまとめる
-        header_row = headers + [timestamp_str]
-        sheet.update('A1', [header_row])
+        sheet.update('A1', [[timestamp_str]])
+        
+        headers = ['順位', 'ユーザー名', '今月の平均', '先月の平均', '変化', '今月の記録', '先月の記録']
+        sheet.update('A2', [headers])
         
         rows = []
         for index, user in enumerate(analysis_data):
-            avg_time_str = seconds_to_time_str(user['averageWakeUpSeconds'])
             rows.append([
                 index + 1,
                 user['userName'],
-                user['postCount'],
-                avg_time_str
+                seconds_to_time_str(user['current_avg_sec']),
+                seconds_to_time_str(user['previous_avg_sec']),
+                format_delta_seconds(user['delta_sec']),
+                user['current_count'],
+                user['previous_count']
             ])
 
         if rows:
-            sheet.update('A2', rows)
+            sheet.update('A3', rows)
 
-        # --- 書式設定と列幅指定をまとめて実行 ---
         requests = [
-            # ヘッダー行を固定
-            { "updateSheetProperties": { "properties": { "sheetId": sheet.id, "gridProperties": { "frozenRowCount": 1 } }, "fields": "gridProperties.frozenRowCount" } },
-            # ヘッダーの書式設定 (A1:D1)
-            { "repeatCell": { "range": { "sheetId": sheet.id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 4 }, "cell": { "userEnteredFormat": { "backgroundColor": { "red": 0.06, "green": 0.68, "blue": 0.86 }, "textFormat": { "foregroundColor": { "red": 1.0, "green": 1.0, "blue": 1.0 }, "bold": True }, "horizontalAlignment": "CENTER" } }, "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)" } },
-            # タイムスタンプの書式設定 (E1)
-            { "repeatCell": { "range": { "sheetId": sheet.id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 4, "endColumnIndex": 5 }, "cell": { "userEnteredFormat": { "textFormat": { "foregroundColor": { "red": 0.4, "green": 0.4, "blue": 0.4 }, "italic": True }, "horizontalAlignment": "RIGHT" } }, "fields": "userEnteredFormat(textFormat,horizontalAlignment)" } },
-            # 全体の垂直方向の配置 (A:E)
-            { "repeatCell": { "range": { "sheetId": sheet.id, "startColumnIndex": 0, "endColumnIndex": 5 }, "cell": { "userEnteredFormat": { "verticalAlignment": "MIDDLE" } }, "fields": "userEnteredFormat.verticalAlignment" } },
-            # 特定列の水平方向の配置 (A, C, D)
-            { "repeatCell": { "range": { "sheetId": sheet.id, "startColumnIndex": 0, "endColumnIndex": 1 }, "cell": { "userEnteredFormat": { "horizontalAlignment": "CENTER" } }, "fields": "userEnteredFormat.horizontalAlignment" } },
-            { "repeatCell": { "range": { "sheetId": sheet.id, "startColumnIndex": 2, "endColumnIndex": 4 }, "cell": { "userEnteredFormat": { "horizontalAlignment": "CENTER" } }, "fields": "userEnteredFormat.horizontalAlignment" } },
-            # 列幅を手動で指定
-            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1 }, "properties": { "pixelSize": 60 }, "fields": "pixelSize" } }, # A列
-            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 2 }, "properties": { "pixelSize": 180 }, "fields": "pixelSize" } }, # B列
-            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 2, "endIndex": 3 }, "properties": { "pixelSize": 80 }, "fields": "pixelSize" } }, # C列
-            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 3, "endIndex": 4 }, "properties": { "pixelSize": 120 }, "fields": "pixelSize" } }, # D列
-            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 4, "endIndex": 5 }, "properties": { "pixelSize": 200 }, "fields": "pixelSize" } }  # E列: タイムスタンプ
+            # --- 全体設定 ---
+            { "updateSheetProperties": { "properties": { "sheetId": sheet.id, "gridProperties": { "frozenRowCount": 2 } }, "fields": "gridProperties.frozenRowCount" } }, # 2行目まで固定
+            # --- タイトル行 (A1) ---
+            { "mergeCells": { "range": { "sheetId": sheet.id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 7 }, "mergeType": "MERGE_ALL" } },
+            { "repeatCell": { "range": { "sheetId": sheet.id, "startRowIndex": 0, "endRowIndex": 1 }, "cell": { "userEnteredFormat": { "textFormat": { "bold": True, "fontSize": 12 }, "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE" } }, "fields": "userEnteredFormat(textFormat,horizontalAlignment,verticalAlignment)" } },
+            # --- ヘッダー行 (A2:G2) ---
+            { "repeatCell": { "range": { "sheetId": sheet.id, "startRowIndex": 1, "endRowIndex": 2 }, "cell": { "userEnteredFormat": { "backgroundColor": { "red": 0.2, "green": 0.2, "blue": 0.2 }, "textFormat": { "foregroundColor": { "red": 1, "green": 1, "blue": 1 }, "bold": True }, "horizontalAlignment": "CENTER" } }, "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)" } },
+            # --- データ行のフォーマット ---
+            { "repeatCell": { "range": { "sheetId": sheet.id, "startRowIndex": 2 }, "cell": { "userEnteredFormat": { "verticalAlignment": "MIDDLE" } }, "fields": "userEnteredFormat.verticalAlignment" } }, # 全体の中央揃え(縦)
+            { "repeatCell": { "range": { "sheetId": sheet.id, "startRowIndex": 2, "startColumnIndex": 0, "endColumnIndex": 1 }, "cell": { "userEnteredFormat": { "horizontalAlignment": "CENTER" } }, "fields": "userEnteredFormat.horizontalAlignment" } }, # A列
+            { "repeatCell": { "range": { "sheetId": sheet.id, "startRowIndex": 2, "startColumnIndex": 2, "endColumnIndex": 7 }, "cell": { "userEnteredFormat": { "horizontalAlignment": "CENTER" } }, "fields": "userEnteredFormat.horizontalAlignment" } }, # C列以降
+            # --- スマホ向け列幅指定 ---
+            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1 }, "properties": { "pixelSize": 40 }, "fields": "pixelSize" } },  # A: 順位
+            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 2 }, "properties": { "pixelSize": 120 }, "fields": "pixelSize" } }, # B: ユーザー名
+            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 2, "endIndex": 5 }, "properties": { "pixelSize": 75 }, "fields": "pixelSize" } },  # C,D,E: 時刻/変化
+            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 5, "endIndex": 7 }, "properties": { "pixelSize": 60 }, "fields": "pixelSize" } },  # F,G: 日数
         ]
         sheet.spreadsheet.batch_update({"requests": requests})
             
@@ -158,7 +176,7 @@ def update_spreadsheet(analysis_data):
         print(f"スプレッドシート更新中にエラーが発生: {e}")
         raise
 
-# --- Discordボットの本体 ---
+# --- Discordボットの本体とスケジューラ ---
 intents = discord.Intents.default()
 intents.messages = True
 intents.message_content = True
@@ -167,18 +185,14 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 @bot.event
 async def on_ready():
     print(f'{bot.user}としてログインしました。')
-    # スケジューラを別スレッドで起動
     schedule_thread = Thread(target=run_scheduler)
     schedule_thread.daemon = True
     schedule_thread.start()
     print("自動集計スケジューラを起動しました。")
 
-# --- 自動集計ジョブ ---
 def daily_job():
-    # botが準備完了するまで待つ
     while not bot.is_ready():
         time.sleep(1)
-    # asyncioのイベントをメインスレッドで安全に実行
     asyncio.run_coroutine_threadsafe(scheduled_analysis(), bot.loop)
 
 async def scheduled_analysis():
@@ -193,17 +207,14 @@ async def scheduled_analysis():
         print(f"自動集計中に致命的なエラーが発生しました: {e}")
 
 def run_scheduler():
-    # 毎日日本時間の深夜2時に実行
-    schedule.every().day.at("17:00").do(daily_job) # UTCで17:00 = JSTで2:00
+    schedule.every().day.at("17:00").do(daily_job) # JST 2:00
     while True:
         schedule.run_pending()
         time.sleep(60)
 
-# --- テスト用コマンド ---
 @bot.command()
 async def analyze(ctx):
-    if ctx.channel.id != TARGET_CHANNEL_ID:
-        return
+    if ctx.channel.id != TARGET_CHANNEL_ID: return
 
     await ctx.send("テスト分析を開始します。少しお待ちください...")
     try:
