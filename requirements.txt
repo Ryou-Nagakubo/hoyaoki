@@ -4,4 +4,3 @@ gspread
 oauth2client
 requests
 gunicorn
-schedule
