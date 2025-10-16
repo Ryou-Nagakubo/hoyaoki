@@ -1,5 +1,5 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from flask import Flask, request
 from threading import Thread
 import os
@@ -9,9 +9,9 @@ from collections import defaultdict
 import datetime
 import requests
 import json
-import time
 import asyncio
 from functools import wraps
+import queue
 
 # --- Renderの環境変数から設定を読み込む ---
 BOT_TOKEN = os.environ.get('DISCORD_TOKEN')
@@ -19,6 +19,9 @@ TARGET_CHANNEL_ID = int(os.environ.get('DISCORD_CHANNEL_ID'))
 SHEET_ID = os.environ.get('SHEET_ID')
 TRIGGER_SECRET = os.environ.get('TRIGGER_SECRET')
 MESSAGE_LIMIT = 20000
+
+# --- グローバルなタスクキュー ---
+analysis_queue = queue.Queue()
 
 # --- Flask (Webサーバー) の設定 ---
 app = Flask('')
@@ -63,14 +66,11 @@ async def perform_analysis():
     target_channel = bot.get_channel(TARGET_CHANNEL_ID)
     if not target_channel:
         return None, "指定されたチャンネルが見つかりませんでした。"
-
     now_jst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
     current_month, current_year = now_jst.month, now_jst.year
     prev_month_date = now_jst.replace(day=1) - datetime.timedelta(days=1)
     prev_month, prev_year = prev_month_date.month, prev_month_date.year
-
     user_daily_first_post = defaultdict(dict)
-    
     async for message in target_channel.history(limit=MESSAGE_LIMIT):
         if message.author.bot: continue
         timestamp_jst = message.created_at + datetime.timedelta(hours=9)
@@ -79,31 +79,20 @@ async def perform_analysis():
         user_name = message.author.global_name or message.author.username
         if date_str not in user_daily_first_post[user_name] or timestamp_jst < user_daily_first_post[user_name][date_str]:
             user_daily_first_post[user_name][date_str] = timestamp_jst
-
-    # 累計と月別のデータを集計
     analysis_data = []
     for user_name, daily_posts in user_daily_first_post.items():
         all_times_sec = [time_to_seconds(dt) for dt in daily_posts.values()]
         current_times_sec = [time_to_seconds(dt) for dt in daily_posts.values() if dt.year == current_year and dt.month == current_month]
         previous_times_sec = [time_to_seconds(dt) for dt in daily_posts.values() if dt.year == prev_year and dt.month == prev_month]
-
         if not all_times_sec: continue
-
         overall_avg = sum(all_times_sec) / len(all_times_sec)
         current_avg = sum(current_times_sec) / len(current_times_sec) if current_times_sec else None
         previous_avg = sum(previous_times_sec) / len(previous_times_sec) if previous_times_sec else None
         delta = current_avg - previous_avg if current_avg is not None and previous_avg is not None else None
-
         analysis_data.append({
-            'userName': user_name,
-            'overall_avg_sec': overall_avg,
-            'overall_count': len(all_times_sec),
-            'current_avg_sec': current_avg,
-            'previous_avg_sec': previous_avg,
-            'delta_sec': delta
+            'userName': user_name, 'overall_avg_sec': overall_avg, 'overall_count': len(all_times_sec),
+            'current_avg_sec': current_avg, 'previous_avg_sec': previous_avg, 'delta_sec': delta
         })
-
-    # 累計平均が早い順にソート
     analysis_data.sort(key=lambda x: x['overall_avg_sec'])
     return analysis_data, None
 
@@ -113,31 +102,20 @@ def update_spreadsheet(analysis_data):
     try:
         sheet = get_sheet()
         sheet.clear()
-        
         now_jst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
         timestamp_str = f"起床時刻ランキング (最終更新: {now_jst.strftime('%Y/%m/%d %H:%M')})"
-        
         sheet.update('A1', [[timestamp_str]])
-        
         headers = ['順位', 'ユーザー名', '累計平均', '累計日数', '今月の平均', '先月の平均', '変化']
         sheet.update('A2', [headers])
-        
         rows = []
         for index, user in enumerate(analysis_data):
             rows.append([
-                index + 1,
-                user['userName'],
-                seconds_to_time_str(user['overall_avg_sec']),
-                user['overall_count'],
-                seconds_to_time_str(user['current_avg_sec']),
-                seconds_to_time_str(user['previous_avg_sec']),
+                index + 1, user['userName'], seconds_to_time_str(user['overall_avg_sec']), user['overall_count'],
+                seconds_to_time_str(user['current_avg_sec']), seconds_to_time_str(user['previous_avg_sec']),
                 format_delta_seconds(user['delta_sec']),
             ])
-
         if rows:
-            # データを3行目から書き込む
             sheet.update('A3', rows)
-
         requests = [
             { "updateSheetProperties": { "properties": { "sheetId": sheet.id, "gridProperties": { "frozenRowCount": 2 } }, "fields": "gridProperties.frozenRowCount" } },
             { "mergeCells": { "range": { "sheetId": sheet.id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 7 }, "mergeType": "MERGE_ALL" } },
@@ -146,30 +124,18 @@ def update_spreadsheet(analysis_data):
             { "repeatCell": { "range": { "sheetId": sheet.id, "startRowIndex": 2 }, "cell": { "userEnteredFormat": { "verticalAlignment": "MIDDLE" } }, "fields": "userEnteredFormat.verticalAlignment" } },
             { "repeatCell": { "range": { "sheetId": sheet.id, "startRowIndex": 2, "startColumnIndex": 0, "endColumnIndex": 1 }, "cell": { "userEnteredFormat": { "horizontalAlignment": "CENTER" } }, "fields": "userEnteredFormat.horizontalAlignment" } },
             { "repeatCell": { "range": { "sheetId": sheet.id, "startRowIndex": 2, "startColumnIndex": 2, "endColumnIndex": 7 }, "cell": { "userEnteredFormat": { "horizontalAlignment": "CENTER" } }, "fields": "userEnteredFormat.horizontalAlignment" } },
-            # 列幅指定
-            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1 }, "properties": { "pixelSize": 40 }, "fields": "pixelSize" } },  # A: 順位
-            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 2 }, "properties": { "pixelSize": 120 }, "fields": "pixelSize" } }, # B: ユーザー名
-            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 2, "endIndex": 4 }, "properties": { "pixelSize": 75 }, "fields": "pixelSize" } },  # C,D: 累計
-            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 4, "endIndex": 7 }, "properties": { "pixelSize": 75 }, "fields": "pixelSize" } },  # E,F,G: 月別
+            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1 }, "properties": { "pixelSize": 40 }, "fields": "pixelSize" } },
+            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 2 }, "properties": { "pixelSize": 120 }, "fields": "pixelSize" } },
+            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 2, "endIndex": 4 }, "properties": { "pixelSize": 75 }, "fields": "pixelSize" } },
+            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 4, "endIndex": 7 }, "properties": { "pixelSize": 75 }, "fields": "pixelSize" } },
         ]
         sheet.spreadsheet.batch_update({"requests": requests})
-            
         print("スプレッドシートの更新が完了しました。")
-        
     except Exception as e:
         print(f"スプレッドシート更新中にエラーが発生: {e}")
         raise
 
-# --- Discordボットの本体とWebhook ---
-intents = discord.Intents.default()
-intents.messages = True
-intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents)
-
-@bot.event
-async def on_ready():
-    print(f'{bot.user}としてログインしました。')
-
+# --- Webhook経由のトリガー ---
 def require_secret(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -181,22 +147,37 @@ def require_secret(f):
 @app.route('/trigger-analysis', methods=['POST'])
 @require_secret
 def handle_trigger_analysis():
-    def run_in_background():
-        asyncio.run_coroutine_threadsafe(scheduled_analysis(), bot.loop)
-    analysis_thread = Thread(target=run_in_background)
-    analysis_thread.start()
+    # タスクをキューに入れるだけ
+    analysis_queue.put(1)
+    print("分析タスクをキューに追加しました。")
     return 'Analysis triggered.', 200
 
-async def scheduled_analysis():
-    print("スケジュールされた自動集計を開始します...")
-    try:
-        analysis_data, error = await perform_analysis()
-        if error:
-            print(f"自動集計エラー: {error}")
-            return
-        update_spreadsheet(analysis_data)
-    except Exception as e:
-        print(f"自動集計中に致命的なエラーが発生しました: {e}")
+# --- Discordボットの本体 ---
+intents = discord.Intents.default()
+intents.messages = True
+intents.message_content = True
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+@bot.event
+async def on_ready():
+    print(f'{bot.user}としてログインしました。')
+    # バックグラウンドタスクを開始
+    check_queue_task.start()
+
+# キューを定期的にチェックするバックグラウンドタスク
+@tasks.loop(seconds=5)
+async def check_queue_task():
+    if not analysis_queue.empty():
+        print("キューからタスクを検出。分析処理を実行します。")
+        analysis_queue.get() # キューからタスクを取り出す
+        try:
+            analysis_data, error = await perform_analysis()
+            if error:
+                print(f"自動集計エラー: {error}")
+                return
+            update_spreadsheet(analysis_data)
+        except Exception as e:
+            print(f"自動集計中に致命的なエラーが発生しました: {e}")
 
 @bot.command()
 async def analyze(ctx):
