@@ -12,6 +12,7 @@ import json
 import asyncio
 from functools import wraps
 import queue
+import time
 
 # --- Renderの環境変数から設定を読み込む ---
 BOT_TOKEN = os.environ.get('DISCORD_TOKEN')
