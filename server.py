@@ -216,4 +216,6 @@ async def analyze(ctx):
 
 # --- 実行 ---
 keep_alive()
+# 起動時にレートリミットを避けるための15秒待機
+time.sleep(15) 
 bot.run(BOT_TOKEN)
