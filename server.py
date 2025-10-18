@@ -19,6 +19,7 @@ BOT_TOKEN = os.environ.get('DISCORD_TOKEN')
 TARGET_CHANNEL_ID = int(os.environ.get('DISCORD_CHANNEL_ID'))
 SHEET_ID = os.environ.get('SHEET_ID')
 TRIGGER_SECRET = os.environ.get('TRIGGER_SECRET')
+# 初回実行時のみ使用するメッセージ取得上限
 MESSAGE_LIMIT = 20000
 
 # --- グローバルなタスクキュー ---
@@ -36,7 +37,7 @@ def keep_alive():
     t.start()
 
 # --- Google Sheets への接続設定 ---
-def get_sheet():
+def get_spreadsheet():
     creds_json_str = os.environ.get('GOOGLE_CREDENTIALS_JSON')
     if not creds_json_str:
         raise ValueError("環境変数 GOOGLE_CREDENTIALS_JSON が設定されていません。")
@@ -44,8 +45,15 @@ def get_sheet():
     scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     client = gspread.authorize(creds)
-    sheet = client.open_by_key(SHEET_ID).sheet1
-    return sheet
+    spreadsheet = client.open_by_key(SHEET_ID)
+    return spreadsheet
+
+def get_or_create_worksheet(spreadsheet, title):
+    try:
+        worksheet = spreadsheet.worksheet(title)
+    except gspread.WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(title=title, rows="100", cols="20")
+    return worksheet
 
 # --- 時刻計算のヘルパー関数 ---
 def time_to_seconds(dt):
@@ -61,28 +69,113 @@ def format_delta_seconds(seconds):
     sign = "+" if total_minutes >= 0 else "-"
     return f"{sign}{abs(total_minutes)}分"
 
+# --- データ永続化ロジック ---
+def load_historical_data(worksheet):
+    print("スプレッドシートから累計データを読み込みます...")
+    records = worksheet.get_all_records()
+    user_daily_first_post = defaultdict(dict)
+    last_timestamp = None
+    if not records:
+        return user_daily_first_post, None
+
+    for record in records:
+        try:
+            user_name = record['ユーザー名']
+            date_str = record['日付']
+            timestamp_str = record['タイムスタンプ']
+            # JSTとして解釈
+            timestamp_dt = datetime.datetime.fromisoformat(timestamp_str).replace(tzinfo=datetime.timezone(datetime.timedelta(hours=9)))
+            user_daily_first_post[user_name][date_str] = timestamp_dt
+        except (KeyError, ValueError) as e:
+            print(f"レコードの読み込みエラー: {record}, エラー: {e}")
+            continue
+
+    # 最後のタイムスタンプを取得 (UTCに変換)
+    last_timestamp_iso = records[-1]['タイムスタンプ']
+    last_timestamp = datetime.datetime.fromisoformat(last_timestamp_iso)
+
+    print(f"累計データの読み込み完了。最終記録時刻: {last_timestamp}")
+    return user_daily_first_post, last_timestamp
+
+def append_new_data(worksheet, new_posts_list):
+    if not new_posts_list:
+        return
+    print(f"{len(new_posts_list)}件の新規データをスプレッドシートに追記します...")
+    # ヘッダーがなければ追記
+    if not worksheet.get_all_values():
+         worksheet.append_row(['ユーザー名', '日付', 'タイムスタンプ'])
+
+    rows_to_append = []
+    for post in new_posts_list:
+        rows_to_append.append([
+            post['user_name'],
+            post['date_str'],
+            post['timestamp'].isoformat() # タイムゾーン情報なしで保存
+        ])
+    worksheet.append_rows(rows_to_append, value_input_option='USER_ENTERED')
+    print("データの追記が完了しました。")
+
+
 # --- メインの分析ロジック ---
 async def perform_analysis():
     print("分析処理を開始します...")
+    
+    # 1. スプレッドシートから累計データを読み込む
+    spreadsheet = get_spreadsheet()
+    db_sheet = get_or_create_worksheet(spreadsheet, "累計データ")
+    user_daily_first_post, last_timestamp = load_historical_data(db_sheet)
+
+    # 2. Discordから新しいメッセージを取得
     target_channel = bot.get_channel(TARGET_CHANNEL_ID)
     if not target_channel:
         return None, "指定されたチャンネルが見つかりませんでした。"
 
+    print("Discordから新規メッセージを取得します...")
+    new_messages = []
+    # last_timestampがNoneなら（初回実行時）、上限まで取得
+    fetch_limit = None if last_timestamp else MESSAGE_LIMIT
+    # afterはUTCである必要があるため、タイムゾーン情報を削除
+    after_utc = last_timestamp.replace(tzinfo=None) if last_timestamp else None
+
+    async for message in target_channel.history(limit=fetch_limit, after=after_utc, oldest_first=True):
+        new_messages.append(message)
+    
+    print(f"{len(new_messages)}件の新規メッセージを取得しました。")
+
+    # 3. 新しいメッセージを処理して、日ごとの最初の投稿を抽出
+    newly_found_posts = defaultdict(dict)
+    for message in new_messages:
+        if message.author.bot: continue
+        
+        timestamp_jst = message.created_at + datetime.timedelta(hours=9)
+        if timestamp_jst.hour >= 17: continue
+
+        date_str = timestamp_jst.strftime("%Y-%m-%d")
+        user_name = message.author.global_name or message.author.username
+
+        if date_str not in newly_found_posts[user_name] and date_str not in user_daily_first_post[user_name]:
+             newly_found_posts[user_name][date_str] = timestamp_jst
+
+    # 4. 抽出した新しいデータをスプレッドシートに追記
+    new_posts_for_sheet = []
+    for user_name, daily_posts in newly_found_posts.items():
+        for date_str, timestamp in daily_posts.items():
+            new_posts_for_sheet.append({
+                'user_name': user_name,
+                'date_str': date_str,
+                'timestamp': timestamp.replace(tzinfo=None) # UTCとして保存
+            })
+            # メモリ上の累計データも更新
+            user_daily_first_post[user_name][date_str] = timestamp
+
+    if new_posts_for_sheet:
+        append_new_data(db_sheet, new_posts_for_sheet)
+
+    # 5. 全データを使ってランキングを計算
     now_jst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
     current_month, current_year = now_jst.month, now_jst.year
     prev_month_date = now_jst.replace(day=1) - datetime.timedelta(days=1)
     prev_month, prev_year = prev_month_date.month, prev_month_date.year
-
-    user_daily_first_post = defaultdict(dict)
-    
-    async for message in target_channel.history(limit=MESSAGE_LIMIT):
-        if message.author.bot: continue
-        timestamp_jst = message.created_at + datetime.timedelta(hours=9)
-        if timestamp_jst.hour >= 17: continue
-        date_str = timestamp_jst.strftime("%Y-%m-%d")
-        user_name = message.author.global_name or message.author.username
-        if date_str not in user_daily_first_post[user_name] or timestamp_jst < user_daily_first_post[user_name][date_str]:
-            user_daily_first_post[user_name][date_str] = timestamp_jst
 
     analysis_data = []
     for user_name, daily_posts in user_daily_first_post.items():
@@ -102,15 +195,16 @@ async def perform_analysis():
             'current_avg_sec': current_avg, 'previous_avg_sec': previous_avg, 'delta_sec': delta
         })
 
-    # 今月の平均が早い順にソート
     analysis_data.sort(key=lambda x: x['current_avg_sec'])
     return analysis_data, None
 
+
 # --- スプレッドシート更新ロジック ---
 def update_spreadsheet(analysis_data):
-    print("スプレッドシートの更新を開始します...")
+    print("ランキングシートの更新を開始します...")
     try:
-        sheet = get_sheet()
+        spreadsheet = get_spreadsheet()
+        sheet = get_or_create_worksheet(spreadsheet, "起床時刻ランキング")
         sheet.clear()
         
         now_jst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
@@ -134,9 +228,9 @@ def update_spreadsheet(analysis_data):
             ])
 
         if rows:
-            # データを3行目から書き込む
             sheet.update('A3', rows)
 
+        # --- シートの書式設定 ---
         requests = [
             { "updateSheetProperties": { "properties": { "sheetId": sheet.id, "gridProperties": { "frozenRowCount": 2 } }, "fields": "gridProperties.frozenRowCount" } },
             { "mergeCells": { "range": { "sheetId": sheet.id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 7 }, "mergeType": "MERGE_ALL" } },
@@ -145,15 +239,14 @@ def update_spreadsheet(analysis_data):
             { "repeatCell": { "range": { "sheetId": sheet.id, "startRowIndex": 2 }, "cell": { "userEnteredFormat": { "verticalAlignment": "MIDDLE" } }, "fields": "userEnteredFormat.verticalAlignment" } },
             { "repeatCell": { "range": { "sheetId": sheet.id, "startRowIndex": 2, "startColumnIndex": 0, "endColumnIndex": 1 }, "cell": { "userEnteredFormat": { "horizontalAlignment": "CENTER" } }, "fields": "userEnteredFormat.horizontalAlignment" } },
             { "repeatCell": { "range": { "sheetId": sheet.id, "startRowIndex": 2, "startColumnIndex": 2, "endColumnIndex": 7 }, "cell": { "userEnteredFormat": { "horizontalAlignment": "CENTER" } }, "fields": "userEnteredFormat.horizontalAlignment" } },
-            # 列幅指定
-            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1 }, "properties": { "pixelSize": 40 }, "fields": "pixelSize" } },  # A: 順位
-            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 2 }, "properties": { "pixelSize": 120 }, "fields": "pixelSize" } }, # B: ユーザー名
-            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 2, "endIndex": 5 }, "properties": { "pixelSize": 75 }, "fields": "pixelSize" } },  # C,D,E: 月別
-            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 5, "endIndex": 7 }, "properties": { "pixelSize": 75 }, "fields": "pixelSize" } },  # F,G: 累計
+            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1 }, "properties": { "pixelSize": 40 }, "fields": "pixelSize" } },
+            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 2 }, "properties": { "pixelSize": 120 }, "fields": "pixelSize" } },
+            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 2, "endIndex": 5 }, "properties": { "pixelSize": 75 }, "fields": "pixelSize" } },
+            { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 5, "endIndex": 7 }, "properties": { "pixelSize": 75 }, "fields": "pixelSize" } },
         ]
         sheet.spreadsheet.batch_update({"requests": requests})
             
-        print("スプレッドシートの更新が完了しました。")
+        print("ランキングシートの更新が完了しました。")
         
     except Exception as e:
         print(f"スプレッドシート更新中にエラーが発生: {e}")
@@ -202,7 +295,7 @@ def handle_trigger_analysis():
 @bot.command()
 async def analyze(ctx):
     if ctx.channel.id != TARGET_CHANNEL_ID: return
-    await ctx.send("テスト分析を開始します。少しお待ちください...")
+    await ctx.send("分析を開始します。少しお待ちください...")
     try:
         analysis_data, error = await perform_analysis()
         if error:
@@ -217,6 +310,5 @@ async def analyze(ctx):
 
 # --- 実行 ---
 keep_alive()
-# 起動時にレートリミットを避けるための15秒待機
-time.sleep(15) 
+time.sleep(15)
 bot.run(BOT_TOKEN)
