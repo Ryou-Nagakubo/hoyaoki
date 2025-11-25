@@ -151,18 +151,21 @@ def append_new_data(worksheet, new_posts_list):
     print("データの追記が完了しました。")
 
 
-# --- メインの分析ロジック ---
+# --- メインの分析ロジック (デバッグ・全表示対応版) ---
 async def perform_analysis():
-    print("分析処理を開始します...")
+    print("=== 分析処理を開始します ===")
     
     # 1. スプレッドシートから累計データを読み込む
     spreadsheet = get_spreadsheet()
     db_sheet = get_or_create_worksheet(spreadsheet, "累計データ")
     user_daily_first_post, last_timestamp = load_historical_data(db_sheet)
 
+    print(f"現在の累計データ保持ユーザー数: {len(user_daily_first_post)}")
+
     # 2. Discordから新しいメッセージを取得
     target_channel = bot.get_channel(TARGET_CHANNEL_ID)
     if not target_channel:
+        print("エラー: 指定されたチャンネルが見つかりません。")
         return None, "指定されたチャンネルが見つかりませんでした。"
 
     print("Discordから新規メッセージを取得します...")
@@ -170,12 +173,13 @@ async def perform_analysis():
     fetch_limit = None if last_timestamp else MESSAGE_LIMIT
     after_utc = last_timestamp.replace(tzinfo=None) if last_timestamp else None
 
+    # 新規メッセージ取得
     async for message in target_channel.history(limit=fetch_limit, after=after_utc, oldest_first=True):
         new_messages.append(message)
     
-    print(f"{len(new_messages)}件の新規メッセージを取得しました。")
+    print(f"新規メッセージ取得数: {len(new_messages)}件")
 
-    # 3. 新しいメッセージを処理して、日ごとの最初の投稿を抽出
+    # 3. 新規データを処理
     newly_found_posts = defaultdict(dict)
     for message in new_messages:
         if message.author.bot: continue
@@ -186,48 +190,77 @@ async def perform_analysis():
         date_str = timestamp_jst.strftime("%Y-%m-%d")
         user_name = message.author.global_name or message.author.username
 
+        # 新規データとして登録（メモリ上の既存データとも重複チェック）
         if date_str not in newly_found_posts[user_name] and date_str not in user_daily_first_post[user_name]:
              newly_found_posts[user_name][date_str] = timestamp_jst
 
-    # 4. 抽出した新しいデータをスプレッドシートに追記
+    # 4. 新規データをシートに追記 & メモリ更新
     new_posts_for_sheet = []
     for user_name, daily_posts in newly_found_posts.items():
         for date_str, timestamp in daily_posts.items():
             new_posts_for_sheet.append({
                 'user_name': user_name,
                 'date_str': date_str,
-                'timestamp': timestamp.replace(tzinfo=None) # UTCとして保存
+                'timestamp': timestamp.replace(tzinfo=None)
             })
             user_daily_first_post[user_name][date_str] = timestamp
 
     if new_posts_for_sheet:
+        print(f"シートへの追記対象: {len(new_posts_for_sheet)}件")
         append_new_data(db_sheet, new_posts_for_sheet)
+    else:
+        print("シートへの追記データはありません。")
 
-    # 5. 全データを使ってランキングを計算
+    # 5. ランキング計算
     now_jst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
     current_month, current_year = now_jst.month, now_jst.year
-    prev_month_date = now_jst.replace(day=1) - datetime.timedelta(days=1)
-    prev_month, prev_year = prev_month_date.month, prev_month_date.year
+    
+    # 先月計算ロジックの修正（年跨ぎ対応）
+    if current_month == 1:
+        prev_month, prev_year = 12, current_year - 1
+    else:
+        prev_month, prev_year = current_month - 1, current_year
+
+    print(f"集計対象: {current_year}年{current_month}月 (比較: {prev_year}年{prev_month}月)")
 
     analysis_data = []
     for user_name, daily_posts in user_daily_first_post.items():
         all_times_sec = [time_to_seconds(dt) for dt in daily_posts.values()]
-        current_times_sec = [time_to_seconds(dt) for dt in daily_posts.values() if dt.year == current_year and dt.month == current_month]
-        previous_times_sec = [time_to_seconds(dt) for dt in daily_posts.values() if dt.year == prev_year and dt.month == prev_month]
+        
+        # 今月と先月のデータを抽出
+        current_times_sec = []
+        previous_times_sec = []
+        
+        for dt in daily_posts.values():
+            sec = time_to_seconds(dt)
+            if dt.year == current_year and dt.month == current_month:
+                current_times_sec.append(sec)
+            if dt.year == prev_year and dt.month == prev_month:
+                previous_times_sec.append(sec)
 
-        if not current_times_sec: continue 
+        # ログ出力: 各ユーザーの状況
+        print(f"- {user_name}: 累計{len(all_times_sec)}件, 今月{len(current_times_sec)}件")
 
+        # 平均計算
         overall_avg = sum(all_times_sec) / len(all_times_sec) if all_times_sec else None
-        current_avg = sum(current_times_sec) / len(current_times_sec)
+        current_avg = sum(current_times_sec) / len(current_times_sec) if current_times_sec else None
         previous_avg = sum(previous_times_sec) / len(previous_times_sec) if previous_times_sec else None
-        delta = current_avg - previous_avg if previous_avg is not None else None
+        delta = current_avg - previous_avg if (current_avg is not None and previous_avg is not None) else None
 
+        # 【変更点】今月の記録がなくてもリストに追加する
         analysis_data.append({
-            'userName': user_name, 'overall_avg_sec': overall_avg, 'overall_count': len(all_times_sec),
-            'current_avg_sec': current_avg, 'previous_avg_sec': previous_avg, 'delta_sec': delta
+            'userName': user_name, 
+            'overall_avg_sec': overall_avg, 
+            'overall_count': len(all_times_sec),
+            'current_avg_sec': current_avg, 
+            'previous_avg_sec': previous_avg, 
+            'delta_sec': delta
         })
 
-    analysis_data.sort(key=lambda x: x['current_avg_sec'])
+    # ソート: 今月の平均が早い順 (Noneの場合は無限大として一番下に)
+    analysis_data.sort(key=lambda x: x['current_avg_sec'] if x['current_avg_sec'] is not None else float('inf'))
+    
+    print(f"ランキング生成完了: {len(analysis_data)}名")
     return analysis_data, None
 
 
@@ -235,8 +268,14 @@ async def perform_analysis():
 def update_spreadsheet(analysis_data):
     print("ランキングシートの更新を開始します...")
     try:
-        sheet = get_sheet()
-        sheet = get_or_create_worksheet(sheet, "起床時刻ランキング")
+        spreadsheet = get_spreadsheet()
+        sheet = get_or_create_worksheet(spreadsheet, "起床時刻ランキング")
+        
+        # シートをクリアする前に、データがあるか確認
+        if not analysis_data:
+            print("更新するデータがありません。")
+            return
+
         sheet.clear()
         
         now_jst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
@@ -249,8 +288,11 @@ def update_spreadsheet(analysis_data):
         
         rows = []
         for index, user in enumerate(analysis_data):
+            # 順位: 今月の記録がない場合は "-" にする等の調整が可能
+            rank = index + 1
+            
             rows.append([
-                index + 1,
+                rank,
                 user['userName'],
                 seconds_to_time_str(user['current_avg_sec']),
                 seconds_to_time_str(user['previous_avg_sec']),
@@ -261,8 +303,9 @@ def update_spreadsheet(analysis_data):
 
         if rows:
             sheet.update('A3', rows)
+            print(f"{len(rows)}行のデータを書き込みました。")
 
-        # --- シートの書式設定 ---
+        # --- シートの書式設定 (変更なし) ---
         requests = [
             { "updateSheetProperties": { "properties": { "sheetId": sheet.id, "gridProperties": { "frozenRowCount": 2 } }, "fields": "gridProperties.frozenRowCount" } },
             { "mergeCells": { "range": { "sheetId": sheet.id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 7 }, "mergeType": "MERGE_ALL" } },
@@ -283,31 +326,6 @@ def update_spreadsheet(analysis_data):
     except Exception as e:
         print(f"スプレッドシート更新中にエラーが発生: {e}")
         raise
-
-# --- Discordボットの本体とWebhook ---
-intents = discord.Intents.default()
-intents.messages = True
-intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents)
-
-@bot.event
-async def on_ready():
-    print(f'{bot.user}としてログインしました。')
-    check_queue_task.start()
-
-@tasks.loop(seconds=5)
-async def check_queue_task():
-    if not analysis_queue.empty():
-        print("キューからタスクを検出。分析処理を実行します。")
-        analysis_queue.get()
-        try:
-            analysis_data, error = await perform_analysis()
-            if error:
-                print(f"自動集計エラー: {error}")
-                return
-            update_spreadsheet(analysis_data)
-        except Exception as e:
-            print(f"自動集計中に致命的なエラーが発生しました: {e}")
 
 def require_secret(f):
     @wraps(f)
