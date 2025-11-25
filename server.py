@@ -19,7 +19,6 @@ BOT_TOKEN = os.environ.get('DISCORD_TOKEN')
 TARGET_CHANNEL_ID = int(os.environ.get('DISCORD_CHANNEL_ID'))
 SHEET_ID = os.environ.get('SHEET_ID')
 TRIGGER_SECRET = os.environ.get('TRIGGER_SECRET')
-# 初回実行時のみ使用するメッセージ取得上限
 MESSAGE_LIMIT = 20000
 
 # --- グローバルなタスクキュー ---
@@ -52,7 +51,8 @@ def get_or_create_worksheet(spreadsheet, title):
     try:
         worksheet = spreadsheet.worksheet(title)
     except gspread.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(title=title, rows="100", cols="20")
+        # 行数を指定せずに作成（デフォルトでOK）
+        worksheet = spreadsheet.add_worksheet(title=title, rows="1000", cols="20")
     return worksheet
 
 # --- 時刻計算のヘルパー関数 ---
@@ -69,12 +69,34 @@ def format_delta_seconds(seconds):
     sign = "+" if total_minutes >= 0 else "-"
     return f"{sign}{abs(total_minutes)}分"
 
-# --- データ永続化ロジック ---
+# --- データ永続化ロジック (修正版) ---
 def load_historical_data(worksheet):
     print("スプレッドシートから累計データを読み込みます...")
+    
+    # 1. ヘッダーチェックと自動修復
+    # 1行目のデータを取得して確認
+    try:
+        header_row = worksheet.row_values(1)
+    except Exception:
+        header_row = []
+
+    expected_headers = ['ユーザー名', '日付', 'タイムスタンプ']
+    
+    # ヘッダーがない、または間違っている場合
+    if not header_row or header_row[0] != expected_headers[0]:
+        print("⚠️ ヘッダーが見つからないか破損しています。自動修復を実行します...")
+        # データがある場合は1行目に挿入、なければ単に追加
+        if worksheet.get_all_values():
+            worksheet.insert_row(expected_headers, index=1)
+        else:
+            worksheet.append_row(expected_headers)
+        print("✅ ヘッダーを修復しました。")
+    
+    # 2. データを読み込む
     records = worksheet.get_all_records()
     user_daily_first_post = defaultdict(dict)
     last_timestamp = None
+    
     if not records:
         return user_daily_first_post, None
 
@@ -83,16 +105,27 @@ def load_historical_data(worksheet):
             user_name = record['ユーザー名']
             date_str = record['日付']
             timestamp_str = record['タイムスタンプ']
+            
+            # データが空文字の場合はスキップ
+            if not user_name or not timestamp_str:
+                continue
+
             # JSTとして解釈
             timestamp_dt = datetime.datetime.fromisoformat(timestamp_str).replace(tzinfo=datetime.timezone(datetime.timedelta(hours=9)))
             user_daily_first_post[user_name][date_str] = timestamp_dt
         except (KeyError, ValueError) as e:
-            print(f"レコードの読み込みエラー: {record}, エラー: {e}")
+            # ヘッダー修復後も古い変なデータが残っている場合の対策
             continue
 
     # 最後のタイムスタンプを取得 (UTCに変換)
-    last_timestamp_iso = records[-1]['タイムスタンプ']
-    last_timestamp = datetime.datetime.fromisoformat(last_timestamp_iso)
+    if records:
+        try:
+            last_record = records[-1]
+            if last_record.get('タイムスタンプ'):
+                last_timestamp_iso = last_record['タイムスタンプ']
+                last_timestamp = datetime.datetime.fromisoformat(last_timestamp_iso)
+        except Exception:
+            pass
 
     print(f"累計データの読み込み完了。最終記録時刻: {last_timestamp}")
     return user_daily_first_post, last_timestamp
@@ -101,9 +134,11 @@ def append_new_data(worksheet, new_posts_list):
     if not new_posts_list:
         return
     print(f"{len(new_posts_list)}件の新規データをスプレッドシートに追記します...")
-    # ヘッダーがなければ追記
-    if not worksheet.get_all_values():
-         worksheet.append_row(['ユーザー名', '日付', 'タイムスタンプ'])
+    
+    # 念のためここでもヘッダーチェック
+    header_row = worksheet.row_values(1)
+    if not header_row or header_row[0] != 'ユーザー名':
+        worksheet.insert_row(['ユーザー名', '日付', 'タイムスタンプ'], index=1)
 
     rows_to_append = []
     for post in new_posts_list:
@@ -132,9 +167,7 @@ async def perform_analysis():
 
     print("Discordから新規メッセージを取得します...")
     new_messages = []
-    # last_timestampがNoneなら（初回実行時）、上限まで取得
     fetch_limit = None if last_timestamp else MESSAGE_LIMIT
-    # afterはUTCである必要があるため、タイムゾーン情報を削除
     after_utc = last_timestamp.replace(tzinfo=None) if last_timestamp else None
 
     async for message in target_channel.history(limit=fetch_limit, after=after_utc, oldest_first=True):
@@ -165,7 +198,6 @@ async def perform_analysis():
                 'date_str': date_str,
                 'timestamp': timestamp.replace(tzinfo=None) # UTCとして保存
             })
-            # メモリ上の累計データも更新
             user_daily_first_post[user_name][date_str] = timestamp
 
     if new_posts_for_sheet:
@@ -183,7 +215,7 @@ async def perform_analysis():
         current_times_sec = [time_to_seconds(dt) for dt in daily_posts.values() if dt.year == current_year and dt.month == current_month]
         previous_times_sec = [time_to_seconds(dt) for dt in daily_posts.values() if dt.year == prev_year and dt.month == prev_month]
 
-        if not current_times_sec: continue # 今月の記録がないユーザーはランキングから除外
+        if not current_times_sec: continue 
 
         overall_avg = sum(all_times_sec) / len(all_times_sec) if all_times_sec else None
         current_avg = sum(current_times_sec) / len(current_times_sec)
@@ -203,8 +235,8 @@ async def perform_analysis():
 def update_spreadsheet(analysis_data):
     print("ランキングシートの更新を開始します...")
     try:
-        spreadsheet = get_spreadsheet()
-        sheet = get_or_create_worksheet(spreadsheet, "起床時刻ランキング")
+        sheet = get_sheet()
+        sheet = get_or_create_worksheet(sheet, "起床時刻ランキング")
         sheet.clear()
         
         now_jst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
