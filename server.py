@@ -7,6 +7,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from collections import defaultdict
 import datetime
+from dateutil import parser # 賢い日付読み取りライブラリ
 import requests
 import json
 import asyncio
@@ -68,36 +69,31 @@ def format_delta_seconds(seconds):
     sign = "+" if total_minutes >= 0 else "-"
     return f"{sign}{abs(total_minutes)}分"
 
-# --- 日付パース関数 (強化版) ---
-def parse_timestamp_robust(timestamp_str):
+# --- 日付パース関数 (最強版) ---
+def parse_timestamp_smart(timestamp_str):
     """
-    様々な形式の日付文字列をパースしてJSTのdatetimeオブジェクトを返す
+    dateutilを使ってあらゆる形式の日付文字列をパースし、JSTのdatetimeを返す
     """
     if not timestamp_str:
         return None
     
-    # パターン1: ISOフォーマット (2025-11-25T07:00:00)
     try:
-        return datetime.datetime.fromisoformat(timestamp_str).replace(tzinfo=datetime.timezone(datetime.timedelta(hours=9)))
-    except ValueError:
-        pass
-    
-    # パターン2: スラッシュ区切り (2025/11/25 7:00:00) - GoogleSheetsの自動変換
-    formats = [
-        "%Y/%m/%d %H:%M:%S",
-        "%Y/%m/%d %H:%M",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M"
-    ]
-    
-    for fmt in formats:
-        try:
-            dt = datetime.datetime.strptime(str(timestamp_str), fmt)
-            return dt.replace(tzinfo=datetime.timezone(datetime.timedelta(hours=9)))
-        except ValueError:
-            continue
-            
-    return None
+        # dateutil.parserは "2025/6/30 2:27:39" も "2025-06-30T..." も自動判別します
+        dt = parser.parse(str(timestamp_str))
+        
+        # タイムゾーン情報の補正 (JSTにする)
+        # もしタイムゾーン情報がなければ、UTCとみなして+9時間する運用に統一
+        if dt.tzinfo is None:
+             # スプレッドシート上の時間はJSTで書かれていると仮定して、そのままJST情報を付与
+             dt = dt.replace(tzinfo=datetime.timezone(datetime.timedelta(hours=9)))
+        else:
+             # タイムゾーン情報がある場合はJSTに変換
+             dt = dt.astimezone(datetime.timezone(datetime.timedelta(hours=9)))
+             
+        return dt
+    except Exception as e:
+        # print(f"日付パース失敗: {timestamp_str} -> {e}")
+        return None
 
 # --- データ永続化ロジック (修正版) ---
 def load_historical_data(worksheet):
@@ -110,6 +106,7 @@ def load_historical_data(worksheet):
 
     expected_headers = ['ユーザー名', '日付', 'タイムスタンプ']
     
+    # ヘッダー修復ロジック
     if not header_row or header_row[0] != expected_headers[0]:
         print("⚠️ ヘッダーが見つからないか破損しています。自動修復を実行します...")
         if worksheet.get_all_values():
@@ -120,7 +117,7 @@ def load_historical_data(worksheet):
     
     records = worksheet.get_all_records()
     user_daily_first_post = defaultdict(dict)
-    valid_records_count = 0
+    valid_count = 0
     
     if not records:
         return user_daily_first_post, None
@@ -134,27 +131,25 @@ def load_historical_data(worksheet):
             if not user_name or not timestamp_str:
                 continue
 
-            # 強化されたパース処理
-            timestamp_dt = parse_timestamp_robust(timestamp_str)
+            # ★ここで最強のパース関数を使う
+            timestamp_dt = parse_timestamp_smart(timestamp_str)
             
             if timestamp_dt is None:
-                # パース失敗時はログに出してスキップ
-                if i < 5: # 大量に出ないように最初の5件だけ
-                    print(f"⚠️ 日付読み取り失敗 (行{i+2}): {timestamp_str}")
+                if i < 3: print(f"スキップ(日付不正): {timestamp_str}")
                 continue
 
-            # 【重要】重複データがある場合、より早い時間を採用する
+            # 重複データは「早い時間」を優先して採用
             if date_str not in user_daily_first_post[user_name]:
                 user_daily_first_post[user_name][date_str] = timestamp_dt
-                valid_records_count += 1
+                valid_count += 1
             elif timestamp_dt < user_daily_first_post[user_name][date_str]:
                 user_daily_first_post[user_name][date_str] = timestamp_dt
 
-        except Exception as e:
+        except Exception:
             continue
 
-    print(f"累計データの読み込み完了。有効レコード数: {valid_records_count}/{len(records)}")
-    return user_daily_first_post, None # last_timestampは一旦使用しない（全取得で整合性重視）
+    print(f"累計データの読み込み完了。有効レコード数: {valid_count}/{len(records)}")
+    return user_daily_first_post, None
 
 def append_new_data(worksheet, new_posts_list):
     if not new_posts_list:
@@ -167,6 +162,7 @@ def append_new_data(worksheet, new_posts_list):
 
     rows_to_append = []
     for post in new_posts_list:
+        # 書き込み時はISOフォーマットで統一するが、読み込みは柔軟に行う
         rows_to_append.append([
             post['user_name'],
             post['date_str'],
@@ -182,7 +178,6 @@ async def perform_analysis():
     
     spreadsheet = get_spreadsheet()
     db_sheet = get_or_create_worksheet(spreadsheet, "累計データ")
-    # last_timestampによるフィルタリングを廃止し、常に全データを正しく評価する
     user_daily_first_post, _ = load_historical_data(db_sheet)
 
     print(f"現在の累計データ保持ユーザー数: {len(user_daily_first_post)}")
@@ -194,10 +189,10 @@ async def perform_analysis():
 
     print("Discordから新規メッセージを取得します...")
     new_messages = []
-    # 常に一定期間分を遡ってチェック（漏れ防止）
+    # 過去データがあっても、念の為一定期間は遡ってチェック（抜け漏れ防止）
     fetch_limit = MESSAGE_LIMIT 
 
-    async for message in target_channel.history(limit=fetch_limit, oldest_first=False): # 最新から遡る
+    async for message in target_channel.history(limit=fetch_limit, oldest_first=False):
         new_messages.append(message)
     
     print(f"取得メッセージ数: {len(new_messages)}件")
@@ -212,16 +207,11 @@ async def perform_analysis():
         date_str = timestamp_jst.strftime("%Y-%m-%d")
         user_name = message.author.global_name or message.author.username
 
-        # まだデータがない、または既存データより早い時間の場合
         is_new = date_str not in user_daily_first_post[user_name]
+        # 既存データより早い時間の投稿が見つかった場合も更新対象とする
         is_earlier = not is_new and timestamp_jst < user_daily_first_post[user_name][date_str]
 
-        if is_new:
-             newly_found_posts[user_name][date_str] = timestamp_jst
-             user_daily_first_post[user_name][date_str] = timestamp_jst
-        elif is_earlier:
-             # 既存データより早い投稿が見つかった場合、メモリ上は更新するが
-             # シートへの追記は重複になるため、ここでは慎重に扱う（今回は追記対象にする）
+        if is_new or is_earlier:
              newly_found_posts[user_name][date_str] = timestamp_jst
              user_daily_first_post[user_name][date_str] = timestamp_jst
 
