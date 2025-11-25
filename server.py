@@ -68,6 +68,37 @@ def format_delta_seconds(seconds):
     sign = "+" if total_minutes >= 0 else "-"
     return f"{sign}{abs(total_minutes)}分"
 
+# --- 日付パース関数 (強化版) ---
+def parse_timestamp_robust(timestamp_str):
+    """
+    様々な形式の日付文字列をパースしてJSTのdatetimeオブジェクトを返す
+    """
+    if not timestamp_str:
+        return None
+    
+    # パターン1: ISOフォーマット (2025-11-25T07:00:00)
+    try:
+        return datetime.datetime.fromisoformat(timestamp_str).replace(tzinfo=datetime.timezone(datetime.timedelta(hours=9)))
+    except ValueError:
+        pass
+    
+    # パターン2: スラッシュ区切り (2025/11/25 7:00:00) - GoogleSheetsの自動変換
+    formats = [
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M"
+    ]
+    
+    for fmt in formats:
+        try:
+            dt = datetime.datetime.strptime(str(timestamp_str), fmt)
+            return dt.replace(tzinfo=datetime.timezone(datetime.timedelta(hours=9)))
+        except ValueError:
+            continue
+            
+    return None
+
 # --- データ永続化ロジック (修正版) ---
 def load_historical_data(worksheet):
     print("スプレッドシートから累計データを読み込みます...")
@@ -89,36 +120,41 @@ def load_historical_data(worksheet):
     
     records = worksheet.get_all_records()
     user_daily_first_post = defaultdict(dict)
-    last_timestamp = None
+    valid_records_count = 0
     
     if not records:
         return user_daily_first_post, None
 
-    for record in records:
+    for i, record in enumerate(records):
         try:
-            user_name = record['ユーザー名']
-            date_str = record['日付']
-            timestamp_str = record['タイムスタンプ']
+            user_name = record.get('ユーザー名')
+            date_str = record.get('日付')
+            timestamp_str = record.get('タイムスタンプ')
             
             if not user_name or not timestamp_str:
                 continue
 
-            timestamp_dt = datetime.datetime.fromisoformat(timestamp_str).replace(tzinfo=datetime.timezone(datetime.timedelta(hours=9)))
-            user_daily_first_post[user_name][date_str] = timestamp_dt
-        except (KeyError, ValueError):
+            # 強化されたパース処理
+            timestamp_dt = parse_timestamp_robust(timestamp_str)
+            
+            if timestamp_dt is None:
+                # パース失敗時はログに出してスキップ
+                if i < 5: # 大量に出ないように最初の5件だけ
+                    print(f"⚠️ 日付読み取り失敗 (行{i+2}): {timestamp_str}")
+                continue
+
+            # 【重要】重複データがある場合、より早い時間を採用する
+            if date_str not in user_daily_first_post[user_name]:
+                user_daily_first_post[user_name][date_str] = timestamp_dt
+                valid_records_count += 1
+            elif timestamp_dt < user_daily_first_post[user_name][date_str]:
+                user_daily_first_post[user_name][date_str] = timestamp_dt
+
+        except Exception as e:
             continue
 
-    if records:
-        try:
-            last_record = records[-1]
-            if last_record.get('タイムスタンプ'):
-                last_timestamp_iso = last_record['タイムスタンプ']
-                last_timestamp = datetime.datetime.fromisoformat(last_timestamp_iso)
-        except Exception:
-            pass
-
-    print(f"累計データの読み込み完了。最終記録時刻: {last_timestamp}")
-    return user_daily_first_post, last_timestamp
+    print(f"累計データの読み込み完了。有効レコード数: {valid_records_count}/{len(records)}")
+    return user_daily_first_post, None # last_timestampは一旦使用しない（全取得で整合性重視）
 
 def append_new_data(worksheet, new_posts_list):
     if not new_posts_list:
@@ -141,15 +177,13 @@ def append_new_data(worksheet, new_posts_list):
 
 
 # --- メインの分析ロジック ---
-# ここで bot が必要になるので、この関数の外側で定義されている必要がありますが
-# Pythonの関数内では実行時まで参照解決が遅延されるため、
-# この位置に関数定義があっても、後で bot を定義すれば動きます。
 async def perform_analysis():
     print("=== 分析処理を開始します ===")
     
     spreadsheet = get_spreadsheet()
     db_sheet = get_or_create_worksheet(spreadsheet, "累計データ")
-    user_daily_first_post, last_timestamp = load_historical_data(db_sheet)
+    # last_timestampによるフィルタリングを廃止し、常に全データを正しく評価する
+    user_daily_first_post, _ = load_historical_data(db_sheet)
 
     print(f"現在の累計データ保持ユーザー数: {len(user_daily_first_post)}")
 
@@ -160,13 +194,13 @@ async def perform_analysis():
 
     print("Discordから新規メッセージを取得します...")
     new_messages = []
-    fetch_limit = None if last_timestamp else MESSAGE_LIMIT
-    after_utc = last_timestamp.replace(tzinfo=None) if last_timestamp else None
+    # 常に一定期間分を遡ってチェック（漏れ防止）
+    fetch_limit = MESSAGE_LIMIT 
 
-    async for message in target_channel.history(limit=fetch_limit, after=after_utc, oldest_first=True):
+    async for message in target_channel.history(limit=fetch_limit, oldest_first=False): # 最新から遡る
         new_messages.append(message)
     
-    print(f"新規メッセージ取得数: {len(new_messages)}件")
+    print(f"取得メッセージ数: {len(new_messages)}件")
 
     newly_found_posts = defaultdict(dict)
     for message in new_messages:
@@ -178,8 +212,18 @@ async def perform_analysis():
         date_str = timestamp_jst.strftime("%Y-%m-%d")
         user_name = message.author.global_name or message.author.username
 
-        if date_str not in newly_found_posts[user_name] and date_str not in user_daily_first_post[user_name]:
+        # まだデータがない、または既存データより早い時間の場合
+        is_new = date_str not in user_daily_first_post[user_name]
+        is_earlier = not is_new and timestamp_jst < user_daily_first_post[user_name][date_str]
+
+        if is_new:
              newly_found_posts[user_name][date_str] = timestamp_jst
+             user_daily_first_post[user_name][date_str] = timestamp_jst
+        elif is_earlier:
+             # 既存データより早い投稿が見つかった場合、メモリ上は更新するが
+             # シートへの追記は重複になるため、ここでは慎重に扱う（今回は追記対象にする）
+             newly_found_posts[user_name][date_str] = timestamp_jst
+             user_daily_first_post[user_name][date_str] = timestamp_jst
 
     new_posts_for_sheet = []
     for user_name, daily_posts in newly_found_posts.items():
@@ -189,7 +233,6 @@ async def perform_analysis():
                 'date_str': date_str,
                 'timestamp': timestamp.replace(tzinfo=None)
             })
-            user_daily_first_post[user_name][date_str] = timestamp
 
     if new_posts_for_sheet:
         print(f"シートへの追記対象: {len(new_posts_for_sheet)}件")
@@ -220,8 +263,6 @@ async def perform_analysis():
                 current_times_sec.append(sec)
             if dt.year == prev_year and dt.month == prev_month:
                 previous_times_sec.append(sec)
-
-        print(f"- {user_name}: 累計{len(all_times_sec)}件, 今月{len(current_times_sec)}件")
 
         overall_avg = sum(all_times_sec) / len(all_times_sec) if all_times_sec else None
         current_avg = sum(current_times_sec) / len(current_times_sec) if current_times_sec else None
@@ -301,10 +342,6 @@ def update_spreadsheet(analysis_data):
     except Exception as e:
         print(f"スプレッドシート更新中にエラーが発生: {e}")
         raise
-
-# ==============================================================================
-# ▼▼▼ ここが消えていました！Discordボットの初期化とコマンド定義 ▼▼▼
-# ==============================================================================
 
 # --- Discordボットの本体とWebhook ---
 intents = discord.Intents.default()
