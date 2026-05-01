@@ -7,20 +7,20 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from collections import defaultdict
 import datetime
-from dateutil import parser # 賢い日付読み取りライブラリ
+from dateutil import parser
 import requests
 import json
 import asyncio
 from functools import wraps
 import queue
-import time
 
 # --- Renderの環境変数から設定を読み込む ---
 BOT_TOKEN = os.environ.get('DISCORD_TOKEN')
 TARGET_CHANNEL_ID = int(os.environ.get('DISCORD_CHANNEL_ID'))
 SHEET_ID = os.environ.get('SHEET_ID')
 TRIGGER_SECRET = os.environ.get('TRIGGER_SECRET')
-MESSAGE_LIMIT = 20000
+MESSAGE_LIMIT = int(os.environ.get('MESSAGE_LIMIT', 2000)) # デフォルトを2万から2000に変更
+PORT = int(os.environ.get('PORT', 8080)) # RenderのPORT指定に対応
 
 # --- グローバルなタスクキュー ---
 analysis_queue = queue.Queue()
@@ -31,7 +31,7 @@ app = Flask('')
 def home():
     return "Bot is running!"
 def run_flask():
-    app.run(host='0.0.0.0', port=8080)
+    app.run(host='0.0.0.0', port=PORT) # 固定ポートから環境変数PORTに変更
 def keep_alive():
     t = Thread(target=run_flask)
     t.start()
@@ -71,34 +71,21 @@ def format_delta_seconds(seconds):
 
 # --- 日付パース関数 (最強版) ---
 def parse_timestamp_smart(timestamp_str):
-    """
-    dateutilを使ってあらゆる形式の日付文字列をパースし、JSTのdatetimeを返す
-    """
     if not timestamp_str:
         return None
-    
     try:
-        # dateutil.parserは "2025/6/30 2:27:39" も "2025-06-30T..." も自動判別します
         dt = parser.parse(str(timestamp_str))
-        
-        # タイムゾーン情報の補正 (JSTにする)
-        # もしタイムゾーン情報がなければ、UTCとみなして+9時間する運用に統一
         if dt.tzinfo is None:
-             # スプレッドシート上の時間はJSTで書かれていると仮定して、そのままJST情報を付与
              dt = dt.replace(tzinfo=datetime.timezone(datetime.timedelta(hours=9)))
         else:
-             # タイムゾーン情報がある場合はJSTに変換
              dt = dt.astimezone(datetime.timezone(datetime.timedelta(hours=9)))
-             
         return dt
     except Exception as e:
-        # print(f"日付パース失敗: {timestamp_str} -> {e}")
         return None
 
 # --- データ永続化ロジック (修正版) ---
 def load_historical_data(worksheet):
     print("スプレッドシートから累計データを読み込みます...")
-    
     try:
         header_row = worksheet.row_values(1)
     except Exception:
@@ -106,7 +93,6 @@ def load_historical_data(worksheet):
 
     expected_headers = ['ユーザー名', '日付', 'タイムスタンプ']
     
-    # ヘッダー修復ロジック
     if not header_row or header_row[0] != expected_headers[0]:
         print("⚠️ ヘッダーが見つからないか破損しています。自動修復を実行します...")
         if worksheet.get_all_values():
@@ -131,14 +117,12 @@ def load_historical_data(worksheet):
             if not user_name or not timestamp_str:
                 continue
 
-            # ★ここで最強のパース関数を使う
             timestamp_dt = parse_timestamp_smart(timestamp_str)
             
             if timestamp_dt is None:
                 if i < 3: print(f"スキップ(日付不正): {timestamp_str}")
                 continue
 
-            # 重複データは「早い時間」を優先して採用
             if date_str not in user_daily_first_post[user_name]:
                 user_daily_first_post[user_name][date_str] = timestamp_dt
                 valid_count += 1
@@ -162,7 +146,6 @@ def append_new_data(worksheet, new_posts_list):
 
     rows_to_append = []
     for post in new_posts_list:
-        # 書き込み時はISOフォーマットで統一するが、読み込みは柔軟に行う
         rows_to_append.append([
             post['user_name'],
             post['date_str'],
@@ -189,7 +172,6 @@ async def perform_analysis():
 
     print("Discordから新規メッセージを取得します...")
     new_messages = []
-    # 過去データがあっても、念の為一定期間は遡ってチェック（抜け漏れ防止）
     fetch_limit = MESSAGE_LIMIT 
 
     async for message in target_channel.history(limit=fetch_limit, oldest_first=False):
@@ -208,7 +190,6 @@ async def perform_analysis():
         user_name = message.author.global_name or message.author.username
 
         is_new = date_str not in user_daily_first_post[user_name]
-        # 既存データより早い時間の投稿が見つかった場合も更新対象とする
         is_earlier = not is_new and timestamp_jst < user_daily_first_post[user_name][date_str]
 
         if is_new or is_earlier:
@@ -391,5 +372,5 @@ async def analyze(ctx):
 
 # --- 実行 ---
 keep_alive()
-time.sleep(15)
+# time.sleep(15) を削除 (Flask起動ブロック防止)
 bot.run(BOT_TOKEN)
