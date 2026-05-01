@@ -14,33 +14,32 @@ import asyncio
 from functools import wraps
 import queue
 
-# --- Renderの環境変数から設定を読み込む ---
 BOT_TOKEN = os.environ.get('DISCORD_TOKEN')
 TARGET_CHANNEL_ID = int(os.environ.get('DISCORD_CHANNEL_ID'))
 SHEET_ID = os.environ.get('SHEET_ID')
 TRIGGER_SECRET = os.environ.get('TRIGGER_SECRET')
-MESSAGE_LIMIT = int(os.environ.get('MESSAGE_LIMIT', 2000)) # デフォルトを2万から2000に変更
-PORT = int(os.environ.get('PORT', 8080)) # RenderのPORT指定に対応
+MESSAGE_LIMIT = int(os.environ.get('MESSAGE_LIMIT', 2000))
+PORT = int(os.environ.get('PORT', 8080))
 
-# --- グローバルなタスクキュー ---
 analysis_queue = queue.Queue()
 
-# --- Flask (Webサーバー) の設定 ---
 app = Flask('')
+
 @app.route('/')
 def home():
     return "Bot is running!"
+
 def run_flask():
-    app.run(host='0.0.0.0', port=PORT) # 固定ポートから環境変数PORTに変更
+    app.run(host='0.0.0.0', port=PORT)
+
 def keep_alive():
     t = Thread(target=run_flask)
     t.start()
 
-# --- Google Sheets への接続設定 ---
 def get_spreadsheet():
     creds_json_str = os.environ.get('GOOGLE_CREDENTIALS_JSON')
     if not creds_json_str:
-        raise ValueError("環境変数 GOOGLE_CREDENTIALS_JSON が設定されていません。")
+        raise ValueError("GOOGLE_CREDENTIALS_JSON is not set.")
     creds_dict = json.loads(creds_json_str)
     scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
@@ -55,21 +54,21 @@ def get_or_create_worksheet(spreadsheet, title):
         worksheet = spreadsheet.add_worksheet(title=title, rows="1000", cols="20")
     return worksheet
 
-# --- 時刻計算のヘルパー関数 ---
 def time_to_seconds(dt):
     return dt.hour * 3600 + dt.minute * 60 + dt.second
+
 def seconds_to_time_str(seconds):
     if seconds is None: return "--:--"
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     return f"{h:02d}:{m:02d}"
+
 def format_delta_seconds(seconds):
     if seconds is None: return "N/A"
     total_minutes = round(seconds / 60)
     sign = "+" if total_minutes >= 0 else "-"
     return f"{sign}{abs(total_minutes)}分"
 
-# --- 日付パース関数 (最強版) ---
 def parse_timestamp_smart(timestamp_str):
     if not timestamp_str:
         return None
@@ -83,9 +82,8 @@ def parse_timestamp_smart(timestamp_str):
     except Exception as e:
         return None
 
-# --- データ永続化ロジック (修正版) ---
 def load_historical_data(worksheet):
-    print("スプレッドシートから累計データを読み込みます...")
+    print("load_historical_data...")
     try:
         header_row = worksheet.row_values(1)
     except Exception:
@@ -94,12 +92,10 @@ def load_historical_data(worksheet):
     expected_headers = ['ユーザー名', '日付', 'タイムスタンプ']
     
     if not header_row or header_row[0] != expected_headers[0]:
-        print("⚠️ ヘッダーが見つからないか破損しています。自動修復を実行します...")
         if worksheet.get_all_values():
             worksheet.insert_row(expected_headers, index=1)
         else:
             worksheet.append_row(expected_headers)
-        print("✅ ヘッダーを修復しました。")
     
     records = worksheet.get_all_records()
     user_daily_first_post = defaultdict(dict)
@@ -120,7 +116,6 @@ def load_historical_data(worksheet):
             timestamp_dt = parse_timestamp_smart(timestamp_str)
             
             if timestamp_dt is None:
-                if i < 3: print(f"スキップ(日付不正): {timestamp_str}")
                 continue
 
             if date_str not in user_daily_first_post[user_name]:
@@ -132,13 +127,11 @@ def load_historical_data(worksheet):
         except Exception:
             continue
 
-    print(f"累計データの読み込み完了。有効レコード数: {valid_count}/{len(records)}")
     return user_daily_first_post, None
 
 def append_new_data(worksheet, new_posts_list):
     if not new_posts_list:
         return
-    print(f"{len(new_posts_list)}件の新規データをスプレッドシートに追記します...")
     
     header_row = worksheet.row_values(1)
     if not header_row or header_row[0] != 'ユーザー名':
@@ -152,32 +145,23 @@ def append_new_data(worksheet, new_posts_list):
             post['timestamp'].isoformat()
         ])
     worksheet.append_rows(rows_to_append, value_input_option='USER_ENTERED')
-    print("データの追記が完了しました。")
 
-
-# --- メインの分析ロジック ---
 async def perform_analysis():
-    print("=== 分析処理を開始します ===")
+    print("perform_analysis...")
     
     spreadsheet = get_spreadsheet()
     db_sheet = get_or_create_worksheet(spreadsheet, "累計データ")
     user_daily_first_post, _ = load_historical_data(db_sheet)
 
-    print(f"現在の累計データ保持ユーザー数: {len(user_daily_first_post)}")
-
     target_channel = bot.get_channel(TARGET_CHANNEL_ID)
     if not target_channel:
-        print("エラー: 指定されたチャンネルが見つかりません。")
-        return None, "指定されたチャンネルが見つかりませんでした。"
+        return None, None, "Channel not found."
 
-    print("Discordから新規メッセージを取得します...")
     new_messages = []
     fetch_limit = MESSAGE_LIMIT 
 
     async for message in target_channel.history(limit=fetch_limit, oldest_first=False):
         new_messages.append(message)
-    
-    print(f"取得メッセージ数: {len(new_messages)}件")
 
     newly_found_posts = defaultdict(dict)
     for message in new_messages:
@@ -206,10 +190,7 @@ async def perform_analysis():
             })
 
     if new_posts_for_sheet:
-        print(f"シートへの追記対象: {len(new_posts_for_sheet)}件")
         append_new_data(db_sheet, new_posts_for_sheet)
-    else:
-        print("シートへの追記データはありません。")
 
     now_jst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
     current_month, current_year = now_jst.month, now_jst.year
@@ -218,8 +199,6 @@ async def perform_analysis():
         prev_month, prev_year = 12, current_year - 1
     else:
         prev_month, prev_year = current_month - 1, current_year
-
-    print(f"集計対象: {current_year}年{current_month}月 (比較: {prev_year}年{prev_month}月)")
 
     analysis_data = []
     for user_name, daily_posts in user_daily_first_post.items():
@@ -251,19 +230,15 @@ async def perform_analysis():
 
     analysis_data.sort(key=lambda x: x['current_avg_sec'] if x['current_avg_sec'] is not None else float('inf'))
     
-    print(f"ランキング生成完了: {len(analysis_data)}名")
-    return analysis_data, None
+    return analysis_data, user_daily_first_post, None
 
-
-# --- スプレッドシート更新ロジック ---
 def update_spreadsheet(analysis_data):
-    print("ランキングシートの更新を開始します...")
+    print("update_spreadsheet...")
     try:
         spreadsheet = get_spreadsheet()
         sheet = get_or_create_worksheet(spreadsheet, "起床時刻ランキング")
         
         if not analysis_data:
-            print("更新するデータがありません。")
             return
 
         sheet.clear()
@@ -291,7 +266,6 @@ def update_spreadsheet(analysis_data):
 
         if rows:
             sheet.update('A3', rows)
-            print(f"{len(rows)}行のデータを書き込みました。")
 
         requests = [
             { "updateSheetProperties": { "properties": { "sheetId": sheet.id, "gridProperties": { "frozenRowCount": 2 } }, "fields": "gridProperties.frozenRowCount" } },
@@ -307,14 +281,65 @@ def update_spreadsheet(analysis_data):
             { "updateDimensionProperties": { "range": { "sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": 5, "endIndex": 7 }, "properties": { "pixelSize": 75 }, "fields": "pixelSize" } },
         ]
         sheet.spreadsheet.batch_update({"requests": requests})
-            
-        print("ランキングシートの更新が完了しました。")
         
     except Exception as e:
-        print(f"スプレッドシート更新中にエラーが発生: {e}")
+        print(f"error: {e}")
         raise
 
-# --- Discordボットの本体とWebhook ---
+def update_monthly_average_sheet(user_daily_first_post):
+    print("update_monthly_average_sheet...")
+    try:
+        spreadsheet = get_spreadsheet()
+        sheet = get_or_create_worksheet(spreadsheet, "月別平均推移")
+        
+        if not user_daily_first_post:
+            return
+
+        sheet.clear()
+
+        all_year_months = set()
+        user_monthly_data = defaultdict(lambda: defaultdict(list))
+
+        for user, daily_posts in user_daily_first_post.items():
+            for date_str, dt in daily_posts.items():
+                ym = f"{dt.year:04d}/{dt.month:02d}"
+                all_year_months.add(ym)
+                user_monthly_data[user][ym].append(time_to_seconds(dt))
+
+        sorted_yms = sorted(list(all_year_months))
+
+        if not sorted_yms:
+            return
+
+        headers = ['ユーザー名'] + sorted_yms
+        
+        rows = []
+        for user, monthly_data in user_monthly_data.items():
+            row = [user]
+            for ym in sorted_yms:
+                if ym in monthly_data and monthly_data[ym]:
+                    avg_sec = sum(monthly_data[ym]) / len(monthly_data[ym])
+                    row.append(seconds_to_time_str(avg_sec))
+                else:
+                    row.append("--:--")
+            rows.append(row)
+
+        rows.sort(key=lambda x: x[0])
+
+        sheet.update('A1', [headers])
+        if rows:
+            sheet.update('A2', rows)
+        
+        requests = [
+            { "updateSheetProperties": { "properties": { "sheetId": sheet.id, "gridProperties": { "frozenRowCount": 1, "frozenColumnCount": 1 } }, "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount" } },
+            { "repeatCell": { "range": { "sheetId": sheet.id, "startRowIndex": 0, "endRowIndex": 1 }, "cell": { "userEnteredFormat": { "backgroundColor": { "red": 0.2, "green": 0.2, "blue": 0.2 }, "textFormat": { "foregroundColor": { "red": 1, "green": 1, "blue": 1 }, "bold": True }, "horizontalAlignment": "CENTER" } }, "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)" } },
+            { "repeatCell": { "range": { "sheetId": sheet.id, "startRowIndex": 1, "startColumnIndex": 1 }, "cell": { "userEnteredFormat": { "horizontalAlignment": "CENTER" } }, "fields": "userEnteredFormat.horizontalAlignment" } },
+        ]
+        sheet.spreadsheet.batch_update({"requests": requests})
+
+    except Exception as e:
+        print(f"error: {e}")
+
 intents = discord.Intents.default()
 intents.messages = True
 intents.message_content = True
@@ -322,22 +347,20 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 @bot.event
 async def on_ready():
-    print(f'{bot.user}としてログインしました。')
     check_queue_task.start()
 
 @tasks.loop(seconds=5)
 async def check_queue_task():
     if not analysis_queue.empty():
-        print("キューからタスクを検出。分析処理を実行します。")
         analysis_queue.get()
         try:
-            analysis_data, error = await perform_analysis()
+            analysis_data, user_daily_first_post, error = await perform_analysis()
             if error:
-                print(f"自動集計エラー: {error}")
                 return
             update_spreadsheet(analysis_data)
+            update_monthly_average_sheet(user_daily_first_post)
         except Exception as e:
-            print(f"自動集計中に致命的なエラーが発生しました: {e}")
+            print(f"error: {e}")
 
 def require_secret(f):
     @wraps(f)
@@ -351,7 +374,6 @@ def require_secret(f):
 @require_secret
 def handle_trigger_analysis():
     analysis_queue.put(1)
-    print("分析タスクをキューに追加しました。")
     return 'Analysis triggered.', 200
 
 @bot.command()
@@ -359,18 +381,16 @@ async def analyze(ctx):
     if ctx.channel.id != TARGET_CHANNEL_ID: return
     await ctx.send("分析を開始します。少しお待ちください...")
     try:
-        analysis_data, error = await perform_analysis()
+        analysis_data, user_daily_first_post, error = await perform_analysis()
         if error:
             await ctx.send(f"エラー: {error}")
             return
         update_spreadsheet(analysis_data)
+        update_monthly_average_sheet(user_daily_first_post)
         sheet_url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}"
         await ctx.send(f"分析が完了しました！\n結果はこちら: {sheet_url}")
     except Exception as e:
         await ctx.send(f"エラーが発生しました: {e}")
-        print(f"コマンド実行エラー: {e}")
 
-# --- 実行 ---
 keep_alive()
-# time.sleep(15) を削除 (Flask起動ブロック防止)
 bot.run(BOT_TOKEN)
