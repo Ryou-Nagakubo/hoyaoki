@@ -165,7 +165,13 @@ async def perform_analysis():
     for message in new_messages:
         if message.author.bot: continue
         
-        timestamp_jst = message.created_at + datetime.timedelta(hours=9)
+        # タイムゾーンの二重加算を防ぎ、正確にJST(日本時間)へ変換する
+        JST = datetime.timezone(datetime.timedelta(hours=9))
+        if message.created_at.tzinfo is None:
+            timestamp_jst = message.created_at.replace(tzinfo=datetime.timezone.utc).astimezone(JST)
+        else:
+            timestamp_jst = message.created_at.astimezone(JST)
+            
         user_name = message.author.global_name or message.author.username
         user_id_map[user_name] = message.author.id
         
