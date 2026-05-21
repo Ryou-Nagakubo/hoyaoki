@@ -15,6 +15,7 @@ from functools import wraps
 import queue
 import re
 
+# --- 環境変数設定 ---
 BOT_TOKEN = os.environ.get('DISCORD_TOKEN')
 TARGET_CHANNEL_ID = int(os.environ.get('DISCORD_CHANNEL_ID'))
 SHEET_ID = os.environ.get('SHEET_ID')
@@ -25,6 +26,7 @@ PORT = int(os.environ.get('PORT', 8080))
 analysis_queue = queue.Queue()
 app = Flask('')
 
+# --- Flask (Webサーバー) ---
 @app.route('/')
 def home():
     return "Bot is running!"
@@ -36,6 +38,7 @@ def keep_alive():
     t = Thread(target=run_flask)
     t.start()
 
+# --- Google Sheets 接続設定 ---
 def get_spreadsheet():
     creds_json_str = os.environ.get('GOOGLE_CREDENTIALS_JSON')
     if not creds_json_str:
@@ -44,20 +47,19 @@ def get_spreadsheet():
     scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     client = gspread.authorize(creds)
-    spreadsheet = client.open_by_key(SHEET_ID)
-    return spreadsheet
+    return client.open_by_key(SHEET_ID)
 
 def get_or_create_worksheet(spreadsheet, title):
     try:
-        worksheet = spreadsheet.worksheet(title)
+        return spreadsheet.worksheet(title)
     except gspread.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(title=title, rows="1000", cols="20")
-    return worksheet
+        return spreadsheet.add_worksheet(title=title, rows="1000", cols="20")
 
+# --- 時刻計算・フォーマット関数 ---
 def time_to_seconds(dt, is_sleep=False):
     if dt is None: return None
     h = dt.hour
-    # 就寝時間 (18:00~03:59) は平均計算のため、0~3時を24~27時として扱う
+    # 就寝時間 (18:00~03:59) の平均計算のため、0~3時を24~27時として扱う
     if is_sleep and h < 12:
         h += 24
     return h * 3600 + dt.minute * 60 + dt.second
@@ -97,13 +99,13 @@ def extract_time_from_text(text):
     if match: return int(match.group(1)), 30
     return None, None
 
+# --- データ読み書きロジック ---
 def load_historical_data(worksheet):
     try: header_row = worksheet.row_values(1)
     except Exception: header_row = []
 
     expected_headers = ['ユーザー名', '日付', '起床時刻', '就寝時刻']
     
-    # 互換性チェック＆マイグレーション
     if not header_row or header_row[0] != 'ユーザー名':
         worksheet.append_row(expected_headers)
     elif len(header_row) == 3 and header_row[2] == 'タイムスタンプ':
@@ -145,6 +147,7 @@ def save_historical_data(worksheet, user_daily_data):
             rows.append([user_name, date_str, w.isoformat() if w else "", s.isoformat() if s else ""])
     worksheet.update('A1', rows)
 
+# --- 分析メインロジック ---
 async def perform_analysis():
     print("perform_analysis...")
     
@@ -154,24 +157,24 @@ async def perform_analysis():
 
     target_channel = bot.get_channel(TARGET_CHANNEL_ID)
     if not target_channel:
-        return None, None, [], "Channel not found."
+        return None, None, [], [], "Channel not found."
 
     new_messages = []
     async for message in target_channel.history(limit=MESSAGE_LIMIT, oldest_first=False):
         new_messages.append(message)
 
     user_id_map = {}
+    JST = datetime.timezone(datetime.timedelta(hours=9))
     
     for message in new_messages:
         if message.author.bot: continue
         
-        # タイムゾーンの二重加算を防ぎ、正確にJST(日本時間)へ変換する
-        JST = datetime.timezone(datetime.timedelta(hours=9))
+        # タイムゾーンの二重加算防止
         if message.created_at.tzinfo is None:
             timestamp_jst = message.created_at.replace(tzinfo=datetime.timezone.utc).astimezone(JST)
         else:
             timestamp_jst = message.created_at.astimezone(JST)
-            
+
         user_name = message.author.global_name or message.author.username
         user_id_map[user_name] = message.author.id
         
@@ -191,14 +194,13 @@ async def perform_analysis():
                 if 4 <= ex_h < 18:
                     dt_to_record = dt_to_record.replace(hour=ex_h, minute=ex_m, second=0, microsecond=0)
         
-        # 既存より古い(早い)データなら採用
         existing_dt = user_daily_data[user_name].get(date_str, {}).get(record_key)
         if existing_dt is None or dt_to_record < existing_dt:
             user_daily_data[user_name][date_str][record_key] = dt_to_record
 
     save_historical_data(db_sheet, user_daily_data)
 
-    now_jst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+    now_jst = datetime.datetime.now(JST)
     current_month, current_year = now_jst.month, now_jst.year
     prev_month, prev_year = (12, current_year - 1) if current_month == 1 else (current_month - 1, current_year)
 
@@ -219,7 +221,6 @@ async def perform_analysis():
             if 'sleep' in dt_dict:
                 s_dt = dt_dict['sleep']
                 s_sec = time_to_seconds(s_dt, is_sleep=True)
-                # 就寝時刻は論理日付の年月でカウント
                 s_logical = s_dt - datetime.timedelta(hours=4)
                 if s_logical.year == current_year and s_logical.month == current_month: cur_sleeps.append(s_sec)
                 if s_logical.year == prev_year and s_logical.month == prev_month: prev_sleeps.append(s_sec)
@@ -238,21 +239,42 @@ async def perform_analysis():
             'delta_sec': cur_w_avg - prev_w_avg if (cur_w_avg is not None and prev_w_avg is not None) else None
         })
 
-    # 起床時間の早い順にソート
     analysis_data.sort(key=lambda x: x['current_wake_avg'] if x['current_wake_avg'] is not None else float('inf'))
     
-    # === 未投稿者の抽出 ===
-    today_str = (now_jst - datetime.timedelta(hours=4)).strftime("%Y-%m-%d")
+    # === 今日の記録サマリーと未投稿者の抽出 ===
+    today_dt = now_jst - datetime.timedelta(hours=4)
+    today_str = today_dt.strftime("%Y-%m-%d")
+    yesterday_str = (today_dt - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    
     active_users = {u for u, d in user_daily_data.items() if any(k.startswith(f"{current_year}-{current_month:02d}") for k in d.keys())}
     
     missing_users = []
+    daily_report_list = []
+    
     for user in active_users:
-        if 'wake' not in user_daily_data[user].get(today_str, {}):
+        today_wake = user_daily_data[user].get(today_str, {}).get('wake')
+        yesterday_sleep = user_daily_data[user].get(yesterday_str, {}).get('sleep')
+        
+        if today_wake is None:
             if user in user_id_map:
                 missing_users.append(f"<@{user_id_map[user]}>")
+        else:
+            wake_str = today_wake.strftime("%H:%M")
+            sleep_str = yesterday_sleep.strftime("%H:%M") if yesterday_sleep else "--:--"
+            
+            daily_report_list.append({
+                'user': user,
+                'wake_time': today_wake,
+                'text': f"**{user}** - 🌅 {wake_str} ｜ 🌙 {sleep_str}"
+            })
+            
+    daily_report_list.sort(key=lambda x: x['wake_time'])
+    daily_summary_texts = [item['text'] for item in daily_report_list]
 
-    return analysis_data, user_daily_data, missing_users, None
+    return analysis_data, user_daily_data, missing_users, daily_summary_texts, None
 
+
+# --- スプレッドシート更新ロジック ---
 def update_spreadsheet(analysis_data):
     try:
         spreadsheet = get_spreadsheet()
@@ -260,7 +282,7 @@ def update_spreadsheet(analysis_data):
         if not analysis_data: return
         sheet.clear()
         
-        now_jst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+        now_jst = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
         sheet.update('A1', [[f"起床時刻ランキング (最終更新: {now_jst.strftime('%Y/%m/%d %H:%M')})"]])
         
         headers = ['順位', 'ユーザー名', '今月の起床', '今月の就寝', '先月の起床', '先月の就寝', '変化(起床)', '累計起床', '累計日数']
@@ -311,7 +333,7 @@ def update_monthly_average_sheet(user_daily_data):
         headers = ['ユーザー名']
         for ym in all_year_months:
             headers.append(f"{ym} 起床")
-            # 2026年5月以降のみ「就寝」の列を追加
+            # 2026年5月以降のみ就寝列を追加
             if ym >= "2026/05":
                 headers.append(f"{ym} 就寝")
         
@@ -327,7 +349,6 @@ def update_monthly_average_sheet(user_daily_data):
                 
                 row.append(seconds_to_time_str(sum(w_secs)/len(w_secs)) if w_secs else "--:--")
                 
-                # 2026年5月以降のみ就寝のデータをセルに追加
                 if ym >= "2026/05":
                     row.append(seconds_to_time_str(sum(s_secs)/len(s_secs), is_sleep=True) if s_secs else "--:--")
             rows.append(row)
@@ -344,6 +365,46 @@ def update_monthly_average_sheet(user_daily_data):
     except Exception as e:
         print(f"error: {e}")
 
+# --- Discord Bot メイン処理 ---
+intents = discord.Intents.default()
+intents.messages = True
+intents.message_content = True
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+@bot.event
+async def on_ready():
+    check_queue_task.start()
+
+# ▼ GASからのトリガーで走る処理（サマリーとメンションを送る）
+@tasks.loop(seconds=5)
+async def check_queue_task():
+    if not analysis_queue.empty():
+        analysis_queue.get()
+        try:
+            analysis_data, user_daily_data, missing_users, daily_summary_texts, error = await perform_analysis()
+            if error: return
+            update_spreadsheet(analysis_data)
+            update_monthly_average_sheet(user_daily_data)
+            
+            channel = bot.get_channel(TARGET_CHANNEL_ID)
+            if channel:
+                msg_lines = ["📊 **本日の記録サマリー**"]
+                
+                if daily_summary_texts:
+                    msg_lines.extend(daily_summary_texts)
+                else:
+                    msg_lines.append("本日の記録はまだありません。")
+                    
+                if missing_users:
+                    msg_lines.append("") # 空行
+                    msg_lines.append("🌅 おはようございます！ 以下のユーザーは本日の起床記録をお願いします！")
+                    msg_lines.append(" ".join(missing_users))
+                    
+                await channel.send("\n".join(msg_lines))
+                
+        except Exception as e:
+            print(f"error: {e}")
+
 def require_secret(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -358,23 +419,23 @@ def handle_trigger_analysis():
     analysis_queue.put(1)
     return 'Analysis triggered.', 200
 
+# ▼ 手動実行コマンド（サマリーとメンションは送らない）
 @bot.command()
 async def analyze(ctx):
     if ctx.channel.id != TARGET_CHANNEL_ID: return
     await ctx.send("分析を開始します。少しお待ちください...")
     try:
-        analysis_data, user_daily_data, missing_users, error = await perform_analysis()
+        # 手動実行時は missing_users 等は使わず、単純に集計とシート更新のみ行う
+        analysis_data, user_daily_data, _, _, error = await perform_analysis()
         if error:
             await ctx.send(f"エラー: {error}")
             return
+            
         update_spreadsheet(analysis_data)
         update_monthly_average_sheet(user_daily_data)
-        sheet_url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}"
-        await ctx.send(f"分析が完了しました！\n結果はこちら: {sheet_url}")
         
-        if missing_users:
-            msg = "🌅 本日の起床記録がまだのようです！忘れずに投稿をお願いします。\n" + " ".join(missing_users)
-            await ctx.send(msg)
+        sheet_url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}"
+        await ctx.send(f"分析とシートの更新が完了しました！\n結果はこちら: {sheet_url}")
             
     except Exception as e:
         await ctx.send(f"エラーが発生しました: {e}")
