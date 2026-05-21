@@ -387,9 +387,9 @@ async def analyze(ctx):
         sheet_url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}"
         await ctx.send(f"分析が完了しました！\n結果はこちら: {sheet_url}")
         
-        if missing_users:
-            msg = "🌅 本日の起床記録がまだのようです！忘れずに投稿をお願いします。\n" + " ".join(missing_users)
-            await ctx.send(msg)
+        # if missing_users:
+        #     msg = "🌅 本日の起床記録がまだのようです！忘れずに投稿をお願いします。\n" + " ".join(missing_users)
+        #     await ctx.send(msg)
             
     except Exception as e:
         await ctx.send(f"エラーが発生しました: {e}")
