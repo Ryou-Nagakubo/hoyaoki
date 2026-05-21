@@ -310,7 +310,10 @@ def update_monthly_average_sheet(user_daily_data):
 
         headers = ['ユーザー名']
         for ym in all_year_months:
-            headers.extend([f"{ym} 起床", f"{ym} 就寝"])
+            headers.append(f"{ym} 起床")
+            # 2026年5月以降のみ「就寝」の列を追加
+            if ym >= "2026/05":
+                headers.append(f"{ym} 就寝")
         
         rows = []
         for user in sorted(user_daily_data.keys()):
@@ -323,7 +326,10 @@ def update_monthly_average_sheet(user_daily_data):
                         if 'sleep' in times: s_secs.append(time_to_seconds(times['sleep'], is_sleep=True))
                 
                 row.append(seconds_to_time_str(sum(w_secs)/len(w_secs)) if w_secs else "--:--")
-                row.append(seconds_to_time_str(sum(s_secs)/len(s_secs), is_sleep=True) if s_secs else "--:--")
+                
+                # 2026年5月以降のみ就寝のデータをセルに追加
+                if ym >= "2026/05":
+                    row.append(seconds_to_time_str(sum(s_secs)/len(s_secs), is_sleep=True) if s_secs else "--:--")
             rows.append(row)
 
         sheet.update('A1', [headers])
@@ -337,33 +343,6 @@ def update_monthly_average_sheet(user_daily_data):
         sheet.spreadsheet.batch_update({"requests": requests})
     except Exception as e:
         print(f"error: {e}")
-
-
-intents = discord.Intents.default()
-intents.messages = True
-intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents)
-
-@bot.event
-async def on_ready():
-    check_queue_task.start()
-
-@tasks.loop(seconds=5)
-async def check_queue_task():
-    if not analysis_queue.empty():
-        analysis_queue.get()
-        try:
-            analysis_data, user_daily_data, missing_users, error = await perform_analysis()
-            if error: return
-            update_spreadsheet(analysis_data)
-            update_monthly_average_sheet(user_daily_data)
-            
-            if missing_users:
-                channel = bot.get_channel(TARGET_CHANNEL_ID)
-                msg = "🌅 おはようございます！ 本日の起床記録がまだのようです。投稿をお願いします！\n" + " ".join(missing_users)
-                await channel.send(msg)
-        except Exception as e:
-            print(f"error: {e}")
 
 def require_secret(f):
     @wraps(f)
